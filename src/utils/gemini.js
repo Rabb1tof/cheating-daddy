@@ -8,6 +8,8 @@ const { GroqTranscriptionSession } = require('./groqTranscription');
 const { resample24kTo16k } = require('./pcm');
 const { listModels } = require('./modelCatalog');
 const { requestGroqCompletion } = require('./groqClient');
+const { getGroqLimitsGeneration, recordGroqLimits } = require('./providerLimits');
+const { trackLiveTransport, connectWithSetupGuard } = require('./liveSetupGuard');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 const { startTransportLog, logTransportEvent, closeTransportLog } = require('./transportLogger');
 
@@ -71,12 +73,28 @@ let reconnectAttempts = 0;
 let geminiReconnectBlockedReason = null;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY = 2000;
+const GEMINI_LIVE_SETUP_TIMEOUT_MS = 15000;
 
 function isNonRetryableGeminiError(error) {
     const detail = [error?.message, error?.reason, error?.code, error?.status].filter(Boolean).join(' ').toLowerCase();
     return /\b(401|403|404|429|1008)\b|quota|resource.?exhausted|rate.?limit|permission|unauthori[sz]ed|api.?key|model.?not.?found|model.?unavailable|invalid.?model|free.?tier/.test(
         detail
     );
+}
+
+function safeGeminiErrorText(error, apiKey) {
+    const detail = error?.message || error?.reason || (error?.code ? `code ${error.code}` : 'Unknown error');
+    let text = String(detail);
+    if (apiKey) text = text.split(apiKey).join('[redacted]');
+    return text
+        .replace(/([?&](?:key|api_key|apiKey)=)[^\s&]+/gi, '$1[redacted]')
+        .replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, '[redacted]')
+        .slice(0, 500);
+}
+
+function geminiErrorStatus(error) {
+    const status = String(error?.status || error?.code || '');
+    return /^[\w-]{1,32}$/.test(status) ? status : null;
 }
 
 function sendToRenderer(channel, data) {
@@ -189,6 +207,14 @@ function hasGroqKey() {
     return key && key.trim() != '';
 }
 
+function observeGroqLimitsForKey(apiKey) {
+    const generation = getGroqLimitsGeneration();
+    return observation => {
+        // Requests already in flight may finish after the user changes keys.
+        if (getGroqApiKey()?.trim() === apiKey) recordGroqLimits(observation, generation);
+    };
+}
+
 function feedGroqAudio(source, pcm) {
     if (!groqTranscriptionSession) return false;
     if (groqAudioMode === 'mic_only' && source === 'system') return true;
@@ -255,6 +281,7 @@ async function initializeGroqTranscriptionSession(profile = 'interview', customP
         apiKey,
         model: primarySpeechModel,
         fallbackModel: fallbackSpeechModel,
+        onRateLimits: observeGroqLimitsForKey(apiKey),
         onTranscribing: () => sendToRenderer('update-status', 'Transcribing...'),
         onTranscript: async transcript => {
             sendToRenderer('update-status', 'Generating response...');
@@ -373,6 +400,7 @@ async function sendToGroq(transcription) {
             disableThinking: config.disableGroqThinking === true,
             signal,
             onProgress: text => display.update(text),
+            onRateLimits: observeGroqLimitsForKey(apiKey),
         });
         if (signal.aborted) return { success: false, error: 'Session closed' };
         const answer = display.finish(result.text);
@@ -432,6 +460,7 @@ async function sendImageToGroq(base64Data, prompt) {
             disableThinking: getConfig().disableGroqThinking === true,
             signal,
             onProgress: text => display.update(text),
+            onRateLimits: observeGroqLimitsForKey(apiKey),
         });
         if (signal.aborted) return { success: false, error: 'Session closed' };
         const answer = display.finish(result.text);
@@ -552,135 +581,164 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         geminiReconnectBlockedReason = null;
     }
 
-    const client = new GoogleGenAI({
-        vertexai: false,
-        apiKey: apiKey,
-        httpOptions: { apiVersion: 'v1beta' },
-    });
-
-    // Get enabled tools first to determine Google Search status
-    const enabledTools = await getEnabledTools();
-    const googleSearchEnabled = enabledTools.some(tool => tool.googleSearch);
-
-    const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled, language);
-    currentSystemPrompt = systemPrompt; // Store for Groq
-    currentResponseLanguage = language;
-
-    // Initialize new conversation session only on first connect
-    if (!isReconnect) {
-        initializeNewSession(profile, customPrompt);
-    }
-
     try {
-        const session = await client.live.connect({
-            model: getConfig().geminiLiveModel,
-            callbacks: {
-                onopen: function () {
-                    logTransportEvent('gemini.live.opened', {});
-                    sendToRenderer('update-status', 'Live session connected');
-                },
-                onmessage: function (message) {
-                    console.log('----------------', message);
-                    logTransportEvent('gemini.live.message', message);
+        // Open the transport log before setup so failures before connect are recorded too.
+        if (!isReconnect) initializeNewSession(profile, customPrompt);
 
-                    // Handle input transcription (what was spoken)
-                    if (message.serverContent?.inputTranscription?.results) {
-                        currentTranscription += formatSpeakerResults(message.serverContent.inputTranscription.results);
-                    } else if (message.serverContent?.inputTranscription?.text) {
-                        const text = message.serverContent.inputTranscription.text;
-                        if (text.trim() !== '') {
-                            currentTranscription += text;
-                        }
-                    }
-
-                    if (message.serverContent?.inputTranscription && geminiTranscriptionFlushTimer) scheduleFinalTranscriptionToGroq();
-
-                    if (!hasGroqKey() && message.serverContent?.outputTranscription?.text) {
-                        const isFirstChunk = messageBuffer === '';
-                        messageBuffer += message.serverContent.outputTranscription.text;
-                        sendToRenderer(isFirstChunk ? 'new-response' : 'update-response', messageBuffer);
-                    }
-
-                    if (message.serverContent?.generationComplete) {
-                        if (currentTranscription.trim() !== '') {
-                            if (!hasGroqKey() && messageBuffer.trim() !== '') {
-                                saveConversationTurn(currentTranscription, messageBuffer);
-                            }
-                            if (hasGroqKey()) scheduleFinalTranscriptionToGroq();
-                            else currentTranscription = '';
-                        }
-                        messageBuffer = '';
-                    }
-
-                    if (message.serverContent?.turnComplete) {
-                        if (hasGroqKey()) scheduleFinalTranscriptionToGroq();
-                        else currentTranscription = '';
-                        messageBuffer = '';
-                        sendToRenderer('update-status', 'Listening...');
-                    }
-                },
-                onerror: function (e) {
-                    console.log('Session error:', e.message);
-                    if (isNonRetryableGeminiError(e)) geminiReconnectBlockedReason = e.message || e.reason || String(e.code);
-                    logTransportEvent('gemini.live.error', {
-                        error: e.message,
-                    });
-                    sendToRenderer('update-status', 'Error: ' + e.message);
-                },
-                onclose: function (e) {
-                    console.log('Session closed:', e.reason);
-                    logTransportEvent('gemini.live.closed', {
-                        reason: e.reason,
-                    });
-
-                    // Don't reconnect if user intentionally closed
-                    if (isUserClosing) {
-                        isUserClosing = false;
-                        closeTransportLog();
-                        sendToRenderer('update-status', 'Session closed');
-                        return;
-                    }
-
-                    if (isNonRetryableGeminiError(e) || geminiReconnectBlockedReason) {
-                        const reason = geminiReconnectBlockedReason || e.reason || e.message || `code ${e.code}`;
-                        sessionParams = null;
-                        closeTransportLog();
-                        sendToRenderer('update-status', `Gemini Live stopped: ${reason}`);
-                        return;
-                    }
-
-                    // Attempt reconnection
-                    if (sessionParams && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-                        attemptReconnect();
-                    } else {
-                        closeTransportLog();
-                        sendToRenderer('update-status', 'Session closed');
-                    }
-                },
-            },
-            config: {
-                responseModalities: [Modality.AUDIO],
-                outputAudioTranscription: {},
-                tools: enabledTools,
-                inputAudioTranscription: {},
-                contextWindowCompression: { slidingWindow: {} },
-                systemInstruction: {
-                    parts: [{ text: systemPrompt }],
-                },
-            },
+        const client = new GoogleGenAI({
+            vertexai: false,
+            apiKey: apiKey,
+            httpOptions: { apiVersion: 'v1beta' },
         });
+        const closeTransport = trackLiveTransport(client);
+
+        // Get enabled tools first to determine Google Search status
+        const enabledTools = await getEnabledTools();
+        const googleSearchEnabled = enabledTools.some(tool => tool.googleSearch);
+
+        const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled, language);
+        currentSystemPrompt = systemPrompt; // Store for Groq
+        currentResponseLanguage = language;
+
+        const session = await connectWithSetupGuard(
+            guard =>
+                client.live.connect({
+                    model: getConfig().geminiLiveModel,
+                    callbacks: {
+                        onopen: function () {
+                            if (guard.isAbandoned()) return;
+                            logTransportEvent('gemini.live.opened', {});
+                        },
+                        onmessage: function (message) {
+                            if (guard.isAbandoned()) return;
+                            console.log('----------------', message);
+                            logTransportEvent('gemini.live.message', message);
+
+                            // Handle input transcription (what was spoken)
+                            if (message.serverContent?.inputTranscription?.results) {
+                                currentTranscription += formatSpeakerResults(message.serverContent.inputTranscription.results);
+                            } else if (message.serverContent?.inputTranscription?.text) {
+                                const text = message.serverContent.inputTranscription.text;
+                                if (text.trim() !== '') {
+                                    currentTranscription += text;
+                                }
+                            }
+
+                            if (message.serverContent?.inputTranscription && geminiTranscriptionFlushTimer) scheduleFinalTranscriptionToGroq();
+
+                            if (!hasGroqKey() && message.serverContent?.outputTranscription?.text) {
+                                const isFirstChunk = messageBuffer === '';
+                                messageBuffer += message.serverContent.outputTranscription.text;
+                                sendToRenderer(isFirstChunk ? 'new-response' : 'update-response', messageBuffer);
+                            }
+
+                            if (message.serverContent?.generationComplete) {
+                                if (currentTranscription.trim() !== '') {
+                                    if (!hasGroqKey() && messageBuffer.trim() !== '') {
+                                        saveConversationTurn(currentTranscription, messageBuffer);
+                                    }
+                                    if (hasGroqKey()) scheduleFinalTranscriptionToGroq();
+                                    else currentTranscription = '';
+                                }
+                                messageBuffer = '';
+                            }
+
+                            if (message.serverContent?.turnComplete) {
+                                if (hasGroqKey()) scheduleFinalTranscriptionToGroq();
+                                else currentTranscription = '';
+                                messageBuffer = '';
+                                sendToRenderer('update-status', 'Listening...');
+                            }
+                        },
+                        onerror: function (e) {
+                            const reason = safeGeminiErrorText(e, apiKey);
+                            console.log('Session error:', reason);
+                            if (guard.isAbandoned()) return;
+                            if (isNonRetryableGeminiError(e)) geminiReconnectBlockedReason = reason;
+                            logTransportEvent('gemini.live.error', {
+                                status: geminiErrorStatus(e),
+                                error: reason,
+                            });
+                            sendToRenderer('update-status', 'Gemini Live error: ' + reason);
+                            if (guard.isWaiting()) {
+                                const setupError = new Error(reason);
+                                setupError.code = e?.code;
+                                guard.fail(setupError);
+                            }
+                        },
+                        onclose: function (e) {
+                            const closeReason = safeGeminiErrorText(e, apiKey);
+                            console.log('Session closed:', closeReason);
+                            if (guard.isAbandoned()) return;
+                            logTransportEvent('gemini.live.closed', {
+                                status: geminiErrorStatus(e),
+                                reason: closeReason,
+                            });
+
+                            // Don't reconnect if user intentionally closed
+                            if (isUserClosing) {
+                                isUserClosing = false;
+                                closeTransportLog();
+                                sendToRenderer('update-status', 'Session closed');
+                                if (guard.isWaiting()) guard.fail(new Error('Session closed'));
+                                return;
+                            }
+
+                            if (guard.isWaiting()) {
+                                const setupError = new Error(closeReason);
+                                setupError.code = e?.code;
+                                guard.fail(setupError);
+                                return;
+                            }
+
+                            if (isNonRetryableGeminiError(e) || geminiReconnectBlockedReason) {
+                                const reason = geminiReconnectBlockedReason || closeReason;
+                                sessionParams = null;
+                                closeTransportLog();
+                                sendToRenderer('update-status', `Gemini Live stopped: ${reason}`);
+                                return;
+                            }
+
+                            // Attempt reconnection
+                            if (sessionParams && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                                attemptReconnect();
+                            } else {
+                                closeTransportLog();
+                                sendToRenderer('update-status', 'Session closed');
+                            }
+                        },
+                    },
+                    config: {
+                        responseModalities: [Modality.AUDIO],
+                        outputAudioTranscription: {},
+                        tools: enabledTools,
+                        inputAudioTranscription: {},
+                        contextWindowCompression: { slidingWindow: {} },
+                        systemInstruction: {
+                            parts: [{ text: systemPrompt }],
+                        },
+                    },
+                }),
+            closeTransport,
+            GEMINI_LIVE_SETUP_TIMEOUT_MS
+        );
 
         isInitializingSession = false;
         if (!isReconnect) {
             sendToRenderer('session-initializing', false);
         }
+        sendToRenderer('update-status', 'Live session connected');
         return session;
     } catch (error) {
-        console.error('Failed to initialize Gemini session:', error);
-        if (isNonRetryableGeminiError(error)) geminiReconnectBlockedReason = error.message;
-        sendToRenderer('update-status', `Gemini Live connection failed: ${error.message}`);
+        const reason = safeGeminiErrorText(error, apiKey);
+        console.error('Failed to initialize Gemini session:', reason);
+        logTransportEvent('gemini.live.connect.failed', { status: geminiErrorStatus(error), reason });
+        if (isNonRetryableGeminiError(error)) geminiReconnectBlockedReason = reason;
+        sendToRenderer('update-status', `Gemini Live connection failed: ${reason}`);
         isInitializingSession = false;
         if (!isReconnect) {
+            sessionParams = null;
+            closeTransportLog();
             sendToRenderer('session-initializing', false);
         }
         return null;

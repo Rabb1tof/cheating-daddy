@@ -1,4 +1,5 @@
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const { parseRetryAfterMs, notifyGroqRateLimits } = require('./groqRateLimits');
 const WINDOW_MS = 60_000;
 const TOKEN_BUDGET = 6_500;
 const TEXT_COMPLETION_TOKENS = 512;
@@ -69,14 +70,6 @@ function raceWithAbort(promise, signal) {
     });
 }
 
-function parseRetryAfter(value, now) {
-    if (!value) return null;
-    const seconds = Number(value);
-    if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
-    const date = Date.parse(value);
-    return Number.isFinite(date) ? Math.max(0, date - now) : null;
-}
-
 function estimateRequestTokens(messages, completionTokens) {
     let tokens = completionTokens;
     for (const message of messages) {
@@ -125,7 +118,7 @@ async function readApiError(response, model, now) {
         details = null;
     }
     const reason = details?.message || raw.slice(0, 1_000) || `HTTP ${response.status}`;
-    const retryAfterMs = response.status === 429 ? parseRetryAfter(response.headers?.get?.('retry-after'), now) : null;
+    const retryAfterMs = response.status === 429 ? parseRetryAfterMs(response.headers?.get?.('retry-after'), now) : null;
     return new GroqApiError(`Groq ${response.status} for ${model}: ${reason}`, {
         status: response.status,
         model,
@@ -247,6 +240,7 @@ function createGroqClient({ now = Date.now, sleep = waitWithSignal, setTimer = s
         kind = 'text',
         disableThinking = false,
         onProgress,
+        onRateLimits,
         fetchImpl = fetch,
         signal,
         timeoutMs = REQUEST_TIMEOUT_MS,
@@ -337,6 +331,7 @@ function createGroqClient({ now = Date.now, sleep = waitWithSignal, setTimer = s
                         throw new GroqApiError(`Could not reach Groq for ${selectedModel}: ${error.message}`, { model: selectedModel });
                     }
 
+                    notifyGroqRateLimits(onRateLimits, response, { kind: 'chat', model: selectedModel, observedAt: now() });
                     ensureActive();
                     if (!response.ok) {
                         const error = await raceWithAbort(readApiError(response, selectedModel, now()), attemptController.signal);

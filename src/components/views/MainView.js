@@ -211,6 +211,25 @@ export class MainView extends LitElement {
             color: var(--error-color);
         }
 
+        .model-picker {
+            display: flex;
+            flex-direction: column;
+            gap: var(--space-xs);
+        }
+
+        .limits-observation {
+            padding: 8px 0;
+            border-top: 1px solid var(--border);
+            font-size: var(--font-size-xs);
+            line-height: var(--line-height);
+            color: var(--text-secondary);
+            overflow-wrap: anywhere;
+        }
+
+        .limits-observation strong {
+            color: var(--text-primary);
+        }
+
         .config-checkbox {
             display: flex;
             align-items: flex-start;
@@ -708,6 +727,7 @@ export class MainView extends LitElement {
         whisperDownloading: { type: Boolean },
         downloadProgress: { type: Object },
         onCancelDownload: { type: Function },
+        startError: { type: String },
         // Internal state
         _mode: { state: true },
         _token: { state: true },
@@ -727,6 +747,7 @@ export class MainView extends LitElement {
         _modelCatalog: { state: true },
         _catalogLoading: { state: true },
         _catalogError: { state: true },
+        _providerLimits: { state: true },
         _tokenError: { state: true },
         _keyError: { state: true },
         // Local AI state
@@ -746,6 +767,7 @@ export class MainView extends LitElement {
         this.whisperDownloading = false;
         this.downloadProgress = { active: false, label: '', percentage: null };
         this.onCancelDownload = () => {};
+        this.startError = '';
 
         this._mode = 'byok';
         this._token = '';
@@ -765,6 +787,8 @@ export class MainView extends LitElement {
         this._modelCatalog = { gemini: null, groq: null };
         this._catalogLoading = { gemini: false, groq: false };
         this._catalogError = { gemini: '', groq: '' };
+        this._providerLimits = { groq: [] };
+        this._limitsUnsubscribe = null;
         this._tokenError = false;
         this._keyError = false;
         this._showLocalHelp = false;
@@ -828,11 +852,20 @@ export class MainView extends LitElement {
     connectedCallback() {
         super.connectedCallback();
         document.addEventListener('keydown', this.boundKeydownHandler);
+        if (typeof cheatingDaddy.getProviderLimits === 'function') {
+            cheatingDaddy
+                .getProviderLimits()
+                .then(limits => (this._providerLimits = limits))
+                .catch(() => {});
+            this._limitsUnsubscribe = cheatingDaddy.onProviderLimitsUpdated?.(limits => (this._providerLimits = limits));
+        }
     }
 
     disconnectedCallback() {
         super.disconnectedCallback();
         document.removeEventListener('keydown', this.boundKeydownHandler);
+        this._limitsUnsubscribe?.();
+        this._limitsUnsubscribe = null;
         if (this._animId) cancelAnimationFrame(this._animId);
     }
 
@@ -1016,8 +1049,45 @@ export class MainView extends LitElement {
         }
     }
 
-    _renderModelOptions(provider, kind) {
-        return (this._modelCatalog[provider]?.[kind] || []).map(model => html`<option value=${model.id}>${model.name}</option>`);
+    _renderModelPicker(provider, kind, selected, save, label, optional = false) {
+        const models = this._modelCatalog[provider]?.[kind] || [];
+        const selectedId = selected.trim();
+        const listed = models.some(model => model.id === selectedId);
+        const prompt = this._catalogLoading[provider]
+            ? 'Loading available models...'
+            : models.length
+              ? `Choose from ${models.length} available models`
+              : this._modelCatalog[provider]
+                ? 'No models suggested for this field'
+                : 'Refresh to load available models';
+
+        return html`
+            <div class="model-picker">
+                <select
+                    aria-label=${`Available ${label}`}
+                    ?disabled=${models.length === 0}
+                    @change=${event => {
+                        if (event.target.value) save(event.target.value);
+                    }}
+                >
+                    <option value="" .selected=${!listed}>${prompt}</option>
+                    ${models.map(
+                        model =>
+                            html`<option value=${model.id} .selected=${model.id === selectedId}>
+                                ${model.name === model.id ? model.id : `${model.name} — ${model.id}`}
+                            </option>`
+                    )}
+                </select>
+                <input
+                    type="text"
+                    aria-label=${`${label} ID`}
+                    placeholder=${optional ? 'Optional custom model ID' : 'Or enter a model ID manually'}
+                    .value=${selected}
+                    @input=${event => save(event.target.value)}
+                />
+            </div>
+            ${this._renderModelHint(provider, kind, selected)}
+        `;
     }
 
     _renderModelHint(provider, kind, selected) {
@@ -1032,62 +1102,115 @@ export class MainView extends LitElement {
 
     _renderCatalogStatus(provider) {
         const catalog = this._modelCatalog[provider];
-        const count = catalog
-            ? new Set(
-                  Object.values(catalog)
-                      .flat()
-                      .map(model => model.id)
-              ).size
-            : 0;
+        const summary = catalog
+            ? provider === 'gemini'
+                ? `${catalog.live.length} Live suggestions; ${catalog.image.length} screenshot suggestions.`
+                : `${catalog.speech.length} speech suggestions; ${catalog.chat.length} response and screenshot suggestions.`
+            : '';
         return html`
             <button class="model-refresh" @click=${() => this._refreshModels(provider)} ?disabled=${this._catalogLoading[provider]}>
                 ${this._catalogLoading[provider] ? 'Loading models...' : 'Refresh available models'}
             </button>
             ${this._catalogError[provider] ? html`<div class="model-status error">${this._catalogError[provider]}</div>` : ''}
-            ${catalog ? html`<div class="model-status">${count} models returned. You can also type any model ID.</div>` : ''}
+            ${catalog ? html`<div class="model-status">${summary} You can also type any model ID.</div>` : ''}
+        `;
+    }
+
+    _formatLimit(value) {
+        return Number.isFinite(value) ? value.toLocaleString() : '—';
+    }
+
+    _formatLimitDuration(milliseconds) {
+        if (!Number.isFinite(milliseconds)) return '';
+        const seconds = Math.ceil(milliseconds / 1000);
+        if (seconds < 60) return `${seconds}s`;
+        if (seconds < 3600) return `${Math.ceil(seconds / 60)}m`;
+        return `${Math.ceil(seconds / 3600)}h`;
+    }
+
+    _renderProviderLimits() {
+        const observations = this._providerLimits?.groq || [];
+        return html`
+            <details class="config-section">
+                <summary class="config-summary">
+                    <span class="config-summary-text">
+                        <span class="config-summary-title">Provider limits</span>
+                        <span class="config-summary-description">Latest observed Groq limits and Gemini dashboard</span>
+                    </span>
+                    ${this._renderConfigChevron()}
+                </summary>
+                <div class="config-content">
+                    <div class="model-status">
+                        Gemini does not expose your remaining project quota to this API key. Check the
+                        <span class="link" @click=${() => this.onExternalLink('https://aistudio.google.com/rate-limit')}>AI Studio rate limits</span>
+                        and <span class="link" @click=${() => this.onExternalLink('https://aistudio.google.com/usage')}>usage</span> dashboards.
+                    </div>
+                    <div class="model-status">
+                        Groq sends requests/day and tokens/minute limits with each API response. Values below are the last observed per model, not a
+                        live account total.
+                    </div>
+                    ${observations.length === 0
+                        ? html`<div class="model-status">No Groq response observed in this app session yet.</div>`
+                        : observations.map(
+                              observation => html`
+                                  <div class="limits-observation">
+                                      <strong>${observation.model}</strong> (${observation.kind}, HTTP ${observation.status}) ·
+                                      ${new Date(observation.observedAt).toLocaleTimeString()}<br />
+                                      Requests/day: ${this._formatLimit(observation.requestsPerDay?.remaining)} /
+                                      ${this._formatLimit(observation.requestsPerDay?.limit)}; tokens/minute:
+                                      ${this._formatLimit(observation.tokensPerMinute?.remaining)} /
+                                      ${this._formatLimit(observation.tokensPerMinute?.limit)}.
+                                      ${Number.isFinite(observation.requestsPerDay?.reset)
+                                          ? html`Daily reset was ${this._formatLimitDuration(observation.requestsPerDay.reset)} after that response.`
+                                          : ''}
+                                      ${Number.isFinite(observation.retryAfterMs)
+                                          ? html`Retry after ${this._formatLimitDuration(observation.retryAfterMs)} from that response.`
+                                          : ''}
+                                  </div>
+                              `
+                          )}
+                    <div class="model-status">
+                        For other Groq limits, see
+                        <span class="link" @click=${() => this.onExternalLink('https://console.groq.com/settings/limits')}>Groq limits</span>.
+                    </div>
+                </div>
+            </details>
         `;
     }
 
     async _saveGeminiLiveModel(val) {
         this._geminiLiveModel = val;
         await cheatingDaddy.storage.updateConfig('geminiLiveModel', val);
-        this.requestUpdate();
     }
 
     async _saveGeminiImageModel(val) {
         this._geminiImageModel = val;
         await cheatingDaddy.storage.updateConfig('geminiImageModel', val);
-        this.requestUpdate();
     }
 
     async _saveGroqSpeechModel(val) {
         this._groqSpeechModel = val;
         await cheatingDaddy.storage.updateConfig('groqSpeechModel', val);
-        this.requestUpdate();
     }
 
     async _saveGroqSpeechFallbackModel(val) {
         this._groqSpeechFallbackModel = val;
         await cheatingDaddy.storage.updateConfig('groqSpeechFallbackModel', val);
-        this.requestUpdate();
     }
 
     async _saveGroqModel(val) {
         this._groqModel = val;
         await cheatingDaddy.storage.updateConfig('groqModel', val);
-        this.requestUpdate();
     }
 
     async _saveGroqFallbackModel(val) {
         this._groqFallbackModel = val;
         await cheatingDaddy.storage.updateConfig('groqFallbackModel', val);
-        this.requestUpdate();
     }
 
     async _saveGroqImageModel(val) {
         this._groqImageModel = val;
         await cheatingDaddy.storage.updateConfig('groqImageModel', val);
-        this.requestUpdate();
     }
 
     async _saveDisableGroqThinking(disabled) {
@@ -1329,42 +1452,53 @@ export class MainView extends LitElement {
                               </div>
                               <div class="form-group">
                                   <label class="form-label">Gemini Live Model</label>
-                                  <input
-                                      type="text"
-                                      list="gemini-live-models"
-                                      .value=${this._geminiLiveModel}
-                                      @input=${e => this._saveGeminiLiveModel(e.target.value)}
-                                  />
-                                  <datalist id="gemini-live-models">${this._renderModelOptions('gemini', 'live')}</datalist>
-                                  ${this._renderModelHint('gemini', 'live', this._geminiLiveModel)}
+                                  ${this._renderModelPicker(
+                                      'gemini',
+                                      'live',
+                                      this._geminiLiveModel,
+                                      value => this._saveGeminiLiveModel(value),
+                                      'Gemini Live model'
+                                  )}
                               </div>
                               ${this._renderCatalogStatus('gemini')}
                           `
                         : html`
                               <div class="form-group">
-                                  <label class="form-label">Groq Whisper model</label>
+                                  <label class="form-label">Groq API Key</label>
                                   <input
-                                      type="text"
-                                      list="groq-speech-models"
-                                      .value=${this._groqSpeechModel}
-                                      @input=${e => this._saveGroqSpeechModel(e.target.value)}
+                                      type="password"
+                                      placeholder="Required for Groq Whisper and responses"
+                                      .value=${this._groqKey}
+                                      @input=${e => this._saveGroqKey(e.target.value)}
+                                      class=${this._keyError ? 'error' : ''}
                                   />
-                                  <datalist id="groq-speech-models">${this._renderModelOptions('groq', 'speech')}</datalist>
-                                  ${this._renderModelHint('groq', 'speech', this._groqSpeechModel)}
+                                  <div class="form-hint">
+                                      <span class="link" @click=${() => this.onExternalLink('https://console.groq.com/keys')}>Get Groq key</span>
+                                  </div>
+                              </div>
+                              <div class="form-group">
+                                  <label class="form-label">Groq Whisper model</label>
+                                  ${this._renderModelPicker(
+                                      'groq',
+                                      'speech',
+                                      this._groqSpeechModel,
+                                      value => this._saveGroqSpeechModel(value),
+                                      'Groq Whisper model'
+                                  )}
                               </div>
                               <div class="form-group">
                                   <label class="form-label">Whisper fallback model</label>
-                                  <input
-                                      type="text"
-                                      list="groq-speech-models"
-                                      placeholder="Optional"
-                                      .value=${this._groqSpeechFallbackModel}
-                                      @input=${e => this._saveGroqSpeechFallbackModel(e.target.value)}
-                                  />
-                                  ${this._renderModelHint('groq', 'speech', this._groqSpeechFallbackModel)}
+                                  ${this._renderModelPicker(
+                                      'groq',
+                                      'speech',
+                                      this._groqSpeechFallbackModel,
+                                      value => this._saveGroqSpeechFallbackModel(value),
+                                      'Groq Whisper fallback model',
+                                      true
+                                  )}
                               </div>
                               <div class="config-note">
-                                  Groq transcribes short audio segments and sends the text to your response model. A Groq key below is required.
+                                  Groq transcribes short audio segments and sends the text to your response model. A Groq key is required.
                               </div>
                           `}
                 </div>
@@ -1379,38 +1513,38 @@ export class MainView extends LitElement {
                     ${this._renderConfigChevron()}
                 </summary>
                 <div class="config-content">
-                    <div class="form-group">
-                        <label class="form-label">Groq API Key</label>
-                        <input
-                            type="password"
-                            placeholder=${this._transcriptionProvider === 'groq' || screenshotProvider === 'groq'
-                                ? 'Required for selected providers'
-                                : 'Optional'}
-                            .value=${this._groqKey}
-                            @input=${e => this._saveGroqKey(e.target.value)}
-                            class=${this._keyError && (this._transcriptionProvider === 'groq' || screenshotProvider === 'groq') ? 'error' : ''}
-                        />
-                        <div class="form-hint">
-                            <span class="link" @click=${() => this.onExternalLink('https://console.groq.com/keys')}>Get Groq key</span>
-                        </div>
-                    </div>
+                    ${this._transcriptionProvider === 'gemini'
+                        ? html`
+                              <div class="form-group">
+                                  <label class="form-label">Groq API Key</label>
+                                  <input
+                                      type="password"
+                                      placeholder=${screenshotProvider === 'groq' ? 'Required for Groq screenshots' : 'Optional for Groq responses'}
+                                      .value=${this._groqKey}
+                                      @input=${e => this._saveGroqKey(e.target.value)}
+                                      class=${this._keyError && screenshotProvider === 'groq' ? 'error' : ''}
+                                  />
+                                  <div class="form-hint">
+                                      <span class="link" @click=${() => this.onExternalLink('https://console.groq.com/keys')}>Get Groq key</span>
+                                  </div>
+                              </div>
+                          `
+                        : ''}
 
                     <div class="form-group">
                         <label class="form-label">Groq Model</label>
-                        <input type="text" list="groq-chat-models" .value=${this._groqModel} @input=${e => this._saveGroqModel(e.target.value)} />
-                        <datalist id="groq-chat-models">${this._renderModelOptions('groq', 'chat')}</datalist>
-                        ${this._renderModelHint('groq', 'chat', this._groqModel)}
+                        ${this._renderModelPicker('groq', 'chat', this._groqModel, value => this._saveGroqModel(value), 'Groq response model')}
                     </div>
                     <div class="form-group">
                         <label class="form-label">Groq answer fallback model</label>
-                        <input
-                            type="text"
-                            list="groq-chat-models"
-                            placeholder="Optional"
-                            .value=${this._groqFallbackModel}
-                            @input=${e => this._saveGroqFallbackModel(e.target.value)}
-                        />
-                        ${this._renderModelHint('groq', 'chat', this._groqFallbackModel)}
+                        ${this._renderModelPicker(
+                            'groq',
+                            'chat',
+                            this._groqFallbackModel,
+                            value => this._saveGroqFallbackModel(value),
+                            'Groq response fallback model',
+                            true
+                        )}
                     </div>
 
                     ${this._renderCatalogStatus('groq')}
@@ -1427,14 +1561,13 @@ export class MainView extends LitElement {
                         ? html`
                               <div class="form-group">
                                   <label class="form-label">Groq screenshot model</label>
-                                  <input
-                                      type="text"
-                                      list="groq-image-models"
-                                      .value=${this._groqImageModel}
-                                      @input=${e => this._saveGroqImageModel(e.target.value)}
-                                  />
-                                  <datalist id="groq-image-models">${this._renderModelOptions('groq', 'image')}</datalist>
-                                  ${this._renderModelHint('groq', 'image', this._groqImageModel)}
+                                  ${this._renderModelPicker(
+                                      'groq',
+                                      'image',
+                                      this._groqImageModel,
+                                      value => this._saveGroqImageModel(value),
+                                      'Groq screenshot model'
+                                  )}
                               </div>
                               <div class="model-status">
                                   The Groq catalog does not identify vision support or free-tier access. Choose a vision model; provider errors appear
@@ -1458,14 +1591,13 @@ export class MainView extends LitElement {
                                   : ''}
                               <div class="form-group">
                                   <label class="form-label">Gemini screenshot model</label>
-                                  <input
-                                      type="text"
-                                      list="gemini-image-models"
-                                      .value=${this._geminiImageModel}
-                                      @input=${e => this._saveGeminiImageModel(e.target.value)}
-                                  />
-                                  <datalist id="gemini-image-models">${this._renderModelOptions('gemini', 'image')}</datalist>
-                                  ${this._renderModelHint('gemini', 'image', this._geminiImageModel)}
+                                  ${this._renderModelPicker(
+                                      'gemini',
+                                      'image',
+                                      this._geminiImageModel,
+                                      value => this._saveGeminiImageModel(value),
+                                      'Gemini screenshot model'
+                                  )}
                               </div>
                               <div class="model-status">
                                   The Gemini catalog lists generation models but does not guarantee image input or free-tier access for every entry.
@@ -1493,6 +1625,7 @@ export class MainView extends LitElement {
                 </div>
             </details>
 
+            ${this._renderProviderLimits()} ${this.startError ? html`<div class="config-note" role="alert">${this.startError}</div>` : ''}
             ${this._renderStartButton()} ${this._renderDivider()}
 
             <!-- Cloud promo intentionally removed from the active UI. -->

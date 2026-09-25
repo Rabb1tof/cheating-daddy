@@ -1,3 +1,5 @@
+const { parseRetryAfterMs, notifyGroqRateLimits } = require('./groqRateLimits');
+
 const SAMPLE_RATE = 24000;
 const BYTES_PER_SAMPLE = 2;
 const MIN_REQUEST_INTERVAL_MS = 10000;
@@ -105,7 +107,7 @@ class SpeechSegmenter {
     }
 }
 
-async function transcribePcm(pcm, { apiKey, model, signal, fetchImpl = fetch }) {
+async function transcribePcm(pcm, { apiKey, model, signal, onRateLimits, fetchImpl = fetch }) {
     const form = new FormData();
     form.append('file', new Blob([pcmToWavBuffer(pcm)], { type: 'audio/wav' }), 'audio.wav');
     form.append('model', model);
@@ -130,6 +132,7 @@ async function transcribePcm(pcm, { apiKey, model, signal, fetchImpl = fetch }) 
             body: form,
             signal: requestController.signal,
         });
+        notifyGroqRateLimits(onRateLimits, response, { kind: 'speech', model, observedAt: Date.now() });
         if (!response.ok) {
             let message = `Groq transcription failed (${response.status})`;
             try {
@@ -140,9 +143,8 @@ async function transcribePcm(pcm, { apiKey, model, signal, fetchImpl = fetch }) 
             }
             const error = new Error(message);
             error.status = response.status;
-            const retryAfter = response.headers?.get('retry-after');
-            const retrySeconds = Number(retryAfter);
-            error.retryAfterMs = Number.isFinite(retrySeconds) && retrySeconds > 0 ? retrySeconds * 1000 : 60000;
+            const retryAfterMs = parseRetryAfterMs(response.headers?.get?.('retry-after'));
+            error.retryAfterMs = retryAfterMs > 0 ? retryAfterMs : 60000;
             throw error;
         }
 
@@ -166,6 +168,7 @@ class GroqTranscriptionSession {
         onError,
         onTranscribing = () => {},
         onFallback = () => {},
+        onRateLimits,
         transcribe = transcribePcm,
         requestIntervalMs = MIN_REQUEST_INTERVAL_MS,
     }) {
@@ -176,6 +179,7 @@ class GroqTranscriptionSession {
         this.onError = onError;
         this.onTranscribing = onTranscribing;
         this.onFallback = onFallback;
+        this.onRateLimits = onRateLimits;
         this.transcribe = transcribe;
         this.requestIntervalMs = requestIntervalMs;
         this.segmenters = new Map();
@@ -222,6 +226,7 @@ class GroqTranscriptionSession {
             apiKey: this.apiKey,
             model: this.model,
             signal: this.abortController.signal,
+            onRateLimits: this.onRateLimits,
         };
         try {
             return await this.transcribe(pcm, options);

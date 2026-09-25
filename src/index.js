@@ -7,6 +7,7 @@ const { createWindow, updateGlobalShortcuts } = require('./utils/window');
 const { setupGeminiIpcHandlers, stopMacOSAudioCapture, sendToRenderer } = require('./utils/gemini');
 const storage = require('./storage');
 const { listModels } = require('./utils/modelCatalog');
+const { getProviderLimits, subscribeProviderLimits, clearGroqLimits } = require('./utils/providerLimits');
 
 const geminiSessionRef = { current: null };
 let mainWindow = null;
@@ -93,7 +94,9 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:set-credentials', async (event, credentials) => {
         try {
+            const oldGroqApiKey = storage.getGroqApiKey();
             storage.setCredentials(credentials);
+            if (oldGroqApiKey !== storage.getGroqApiKey()) clearGroqLimits();
             return { success: true };
         } catch (error) {
             console.error('Error setting credentials:', error);
@@ -131,7 +134,9 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:set-groq-api-key', async (event, groqApiKey) => {
         try {
+            const oldGroqApiKey = storage.getGroqApiKey();
             storage.setGroqApiKey(groqApiKey);
+            if (oldGroqApiKey !== storage.getGroqApiKey()) clearGroqLimits();
             return { success: true };
         } catch (error) {
             console.error('Error setting Groq API key:', error);
@@ -260,6 +265,7 @@ function setupStorageIpcHandlers() {
     ipcMain.handle('storage:clear-all', async () => {
         try {
             storage.clearAllData();
+            clearGroqLimits();
             return { success: true };
         } catch (error) {
             console.error('Error clearing all data:', error);
@@ -269,6 +275,9 @@ function setupStorageIpcHandlers() {
 }
 
 function setupGeneralIpcHandlers() {
+    subscribeProviderLimits(snapshot => sendToRenderer('provider-limits:updated', snapshot));
+    ipcMain.handle('provider-limits:get', async () => getProviderLimits());
+
     ipcMain.handle('get-app-version', async () => {
         return app.getVersion();
     });

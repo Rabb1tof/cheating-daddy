@@ -20,7 +20,9 @@ function groupGeminiModels(models) {
     return {
         // Gemini's model catalog does not expose a reliable Live capability flag.
         // Keep this a suggestion list; the API validates compatibility at connect time.
-        live: normalized.filter(model => /live/i.test(model.id) && !/transcrib|translat/i.test(model.id)),
+        live: normalized.filter(
+            model => /live|native-audio/i.test(model.id) && !/transcrib|transcript|translat|tts|text-to-speech|speech-to-text/i.test(model.id)
+        ),
         image: models
             .filter(
                 model =>

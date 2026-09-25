@@ -7,6 +7,12 @@ module.exports = {
         extraResource: ['./src/assets/SystemAudioDump', './macos/SystemAudioDump/LICENSE'],
         name: 'Cheating Daddy',
         icon: 'src/assets/logo',
+        osxSign: {
+            identity: '-',
+            identityValidation: false,
+            continueOnError: false,
+            optionsForFile: () => ({ timestamp: 'none' }),
+        },
         extendInfo: {
             NSMicrophoneUsageDescription: 'Cheating Daddy captures microphone audio only while an assistant session is active.',
             NSAudioCaptureUsageDescription: 'Cheating Daddy captures system audio only while an assistant session is active.',

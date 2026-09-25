@@ -59,6 +59,8 @@ jobs:
           plutil -extract NSAudioCaptureUsageDescription raw -o - "$app/Contents/Info.plist"
           test -s "$app/Contents/Resources/LICENSE"
           test "$(lipo -archs "$app/Contents/Resources/SystemAudioDump")" = arm64
+          codesign --verify --verbose=2 "$app/Contents/Resources/SystemAudioDump"
+          codesign --verify --deep --strict --verbose=2 "$app"
           dmg=$(find out/make -maxdepth 1 -type f -name '*.dmg' -print -quit)
           test -s "$dmg"
           shasum -a 256 "$dmg" | sed "s#out/make/##" > out/make/SHA256SUMS-macos.txt
@@ -69,3 +71,42 @@ jobs:
             out/make/*.dmg
             out/make/SHA256SUMS-macos.txt
           if-no-files-found: error
+
+  release:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: cheating-daddy-windows-x64-0.8.1
+          path: artifacts/windows
+      - uses: actions/download-artifact@v7
+        with:
+          name: cheating-daddy-macos-arm64-0.8.1
+          path: artifacts/macos
+      - name: Verify artifacts and prepare release files
+        run: |
+          (cd artifacts/windows && sed 's/\r$//' SHA256SUMS.txt | sha256sum --check)
+          (cd artifacts/macos && sha256sum --check SHA256SUMS-macos.txt)
+          installer=$(find artifacts/windows -maxdepth 1 -type f -name '*Setup.exe' -print -quit)
+          dmg=$(find artifacts/macos -maxdepth 1 -type f -name '*.dmg' -print -quit)
+          test -s "$installer"
+          test -s "$dmg"
+          mkdir -p release
+          cp "$installer" release/Cheating-Daddy-0.8.1-Setup-x64.exe
+          cp "$dmg" release/Cheating-Daddy-0.8.1-arm64.dmg
+          (cd release && sha256sum *.exe *.dmg > SHA256SUMS.txt)
+      - name: Publish installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create v0.8.1 release/*.exe release/*.dmg release/SHA256SUMS.txt \
+            --target "$GITHUB_SHA" \
+            --title 'Cheating Daddy 0.8.1' \
+            --notes-file docs/releases/v0.8.1.md

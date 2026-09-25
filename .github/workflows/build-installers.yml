@@ -1,0 +1,71 @@
+name: Build installers
+
+on:
+  push:
+    branches:
+      - release/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run make -- --platform=win32 --arch=x64
+      - name: Verify installer and write checksum
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -LiteralPath 'out/make/squirrel.windows/x64' -Filter '*Setup.exe' -File | Select-Object -First 1
+          if (-not $installer -or $installer.Length -le 0) { throw 'Windows installer was not created' }
+          $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($installer.Name)" | Set-Content -LiteralPath 'out/make/squirrel.windows/x64/SHA256SUMS.txt' -Encoding ascii
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cheating-daddy-windows-x64-0.8.1
+          path: out/make/squirrel.windows/x64/
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Build the macOS 15 arm64 audio helper
+        run: |
+          swift build --package-path macos/SystemAudioDump -c release
+          cp "$(swift build --package-path macos/SystemAudioDump -c release --show-bin-path)/SystemAudioDump" src/assets/SystemAudioDump
+          chmod +x src/assets/SystemAudioDump
+          test "$(lipo -archs src/assets/SystemAudioDump)" = arm64
+      - run: npm ci
+      - run: npm test
+      - run: npm run make -- --platform=darwin --arch=arm64
+      - name: Verify app permissions and DMG
+        run: |
+          app=$(find out -maxdepth 2 -type d -name '*.app' -print -quit)
+          test -n "$app"
+          plutil -extract NSMicrophoneUsageDescription raw -o - "$app/Contents/Info.plist"
+          plutil -extract NSAudioCaptureUsageDescription raw -o - "$app/Contents/Info.plist"
+          test -s "$app/Contents/Resources/LICENSE"
+          test "$(lipo -archs "$app/Contents/Resources/SystemAudioDump")" = arm64
+          dmg=$(find out/make -maxdepth 1 -type f -name '*.dmg' -print -quit)
+          test -s "$dmg"
+          shasum -a 256 "$dmg" | sed "s#out/make/##" > out/make/SHA256SUMS-macos.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cheating-daddy-macos-arm64-0.8.1
+          path: |
+            out/make/*.dmg
+            out/make/SHA256SUMS-macos.txt
+          if-no-files-found: error

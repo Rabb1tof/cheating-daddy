@@ -4,9 +4,13 @@ const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 module.exports = {
     packagerConfig: {
         asar: true,
-        extraResource: ['./src/assets/SystemAudioDump'],
+        extraResource: ['./src/assets/SystemAudioDump', './macos/SystemAudioDump/LICENSE'],
         name: 'Cheating Daddy',
         icon: 'src/assets/logo',
+        extendInfo: {
+            NSMicrophoneUsageDescription: 'Cheating Daddy captures microphone audio only while an assistant session is active.',
+            NSAudioCaptureUsageDescription: 'Cheating Daddy captures system audio only while an assistant session is active.',
+        },
         // use `security find-identity -v -p codesigning` to find your identity
         // for macos signing
         // also fuck apple

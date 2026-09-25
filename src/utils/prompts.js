@@ -201,7 +201,7 @@ Provide direct exam answers in **markdown format**. Include the question text, t
     },
 };
 
-function buildSystemPrompt(promptParts, customPrompt = '', googleSearchEnabled = true) {
+function buildSystemPrompt(promptParts, customPrompt = '', googleSearchEnabled = true, language = 'en-US') {
     const sections = [promptParts.intro, '\n\n', promptParts.formatRequirements];
 
     // Only add search usage section if Google Search is enabled
@@ -209,17 +209,44 @@ function buildSystemPrompt(promptParts, customPrompt = '', googleSearchEnabled =
         sections.push('\n\n', promptParts.searchUsage);
     }
 
-    sections.push('\n\n', promptParts.content, '\n\nUser-provided context\n-----\n', customPrompt, '\n-----\n\n', promptParts.outputInstructions);
+    const responseLanguage = typeof language === 'string' && /^[a-z]{2,3}-[A-Z]{2}$/.test(language) ? language : 'en-US';
+    const languageName = new Intl.DisplayNames(['en'], { type: 'language' }).of(responseLanguage.split('-')[0]);
+    sections.push(
+        '\n\n',
+        promptParts.content,
+        '\n\nUser-provided context\n-----\n',
+        customPrompt,
+        '\n-----\n\n',
+        promptParts.outputInstructions,
+        `\n\n**RESPONSE LANGUAGE:** Write every answer in ${languageName} (${responseLanguage}).`
+    );
 
     return sections.join('');
 }
 
-function getSystemPrompt(profile, customPrompt = '', googleSearchEnabled = true) {
+function getSystemPrompt(profile, customPrompt = '', googleSearchEnabled = true, language = 'en-US') {
     const promptParts = profilePrompts[profile] || profilePrompts.interview;
-    return buildSystemPrompt(promptParts, customPrompt, googleSearchEnabled);
+    return buildSystemPrompt(promptParts, customPrompt, googleSearchEnabled, language);
+}
+
+function getCompactSystemPrompt(profile, customPrompt = '', language = 'en-US') {
+    const promptParts = profilePrompts[profile] || profilePrompts.interview;
+    const responseLanguage = typeof language === 'string' && /^[a-z]{2,3}-[A-Z]{2}$/.test(language) ? language : 'en-US';
+    const languageName = new Intl.DisplayNames(['en'], { type: 'language' }).of(responseLanguage.split('-')[0]);
+    const context = String(customPrompt || '').slice(0, 1800);
+    return [
+        promptParts.intro,
+        promptParts.formatRequirements,
+        promptParts.outputInstructions,
+        context ? `User context:\n${context}` : '',
+        `Write every answer in ${languageName} (${responseLanguage}).`,
+    ]
+        .filter(Boolean)
+        .join('\n\n');
 }
 
 module.exports = {
     profilePrompts,
     getSystemPrompt,
+    getCompactSystemPrompt,
 };

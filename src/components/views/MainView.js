@@ -195,6 +195,22 @@ export class MainView extends LitElement {
             line-height: var(--line-height);
         }
 
+        .model-refresh {
+            align-self: flex-start;
+            width: auto;
+            cursor: pointer;
+        }
+
+        .model-status {
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+            line-height: var(--line-height);
+        }
+
+        .model-status.error {
+            color: var(--error-color);
+        }
+
         .config-checkbox {
             display: flex;
             align-items: flex-start;
@@ -698,10 +714,19 @@ export class MainView extends LitElement {
         _geminiKey: { state: true },
         _groqKey: { state: true },
         _openaiKey: { state: true },
+        _transcriptionProvider: { state: true },
+        _screenshotProvider: { state: true },
         _geminiLiveModel: { state: true },
+        _geminiImageModel: { state: true },
+        _groqSpeechModel: { state: true },
+        _groqSpeechFallbackModel: { state: true },
         _groqModel: { state: true },
+        _groqFallbackModel: { state: true },
         _groqImageModel: { state: true },
         _disableGroqThinking: { state: true },
+        _modelCatalog: { state: true },
+        _catalogLoading: { state: true },
+        _catalogError: { state: true },
         _tokenError: { state: true },
         _keyError: { state: true },
         // Local AI state
@@ -727,10 +752,19 @@ export class MainView extends LitElement {
         this._geminiKey = '';
         this._groqKey = '';
         this._openaiKey = '';
-        this._geminiLiveModel = 'gemini-3.1-flash-live-preview';
-        this._groqModel = 'qwen/qwen3.6-27b';
-        this._groqImageModel = 'qwen/qwen3.6-27b';
+        this._transcriptionProvider = 'gemini';
+        this._screenshotProvider = 'auto';
+        this._geminiLiveModel = 'gemini-3.8-live';
+        this._geminiImageModel = 'gemini-3.8-flash';
+        this._groqSpeechModel = 'whisper-large-v3-turbo';
+        this._groqSpeechFallbackModel = 'whisper-large-v3';
+        this._groqModel = 'qwen/qwen3.8-27b';
+        this._groqFallbackModel = 'openai/gpt-oss-20b';
+        this._groqImageModel = 'qwen/qwen3.8-27b';
         this._disableGroqThinking = true;
+        this._modelCatalog = { gemini: null, groq: null };
+        this._catalogLoading = { gemini: false, groq: false };
+        this._catalogError = { gemini: '', groq: '' };
         this._tokenError = false;
         this._keyError = false;
         this._showLocalHelp = false;
@@ -767,9 +801,15 @@ export class MainView extends LitElement {
             this._geminiKey = (await cheatingDaddy.storage.getApiKey().catch(() => '')) || '';
             this._groqKey = (await cheatingDaddy.storage.getGroqApiKey().catch(() => '')) || '';
             this._openaiKey = creds.openaiKey || '';
-            this._geminiLiveModel = config.geminiLiveModel || 'gemini-3.1-flash-live-preview';
-            this._groqModel = config.groqModel || 'qwen/qwen3.6-27b';
-            this._groqImageModel = config.groqImageModel || 'qwen/qwen3.6-27b';
+            this._transcriptionProvider = config.transcriptionProvider === 'groq' ? 'groq' : 'gemini';
+            this._screenshotProvider = ['auto', 'gemini', 'groq'].includes(config.screenshotProvider) ? config.screenshotProvider : 'auto';
+            this._geminiLiveModel = config.geminiLiveModel || 'gemini-3.8-live';
+            this._geminiImageModel = config.geminiImageModel || 'gemini-3.8-flash';
+            this._groqSpeechModel = config.groqSpeechModel || 'whisper-large-v3-turbo';
+            this._groqSpeechFallbackModel = config.groqSpeechFallbackModel || '';
+            this._groqModel = config.groqModel || 'qwen/qwen3.8-27b';
+            this._groqFallbackModel = config.groqFallbackModel || '';
+            this._groqImageModel = config.groqImageModel || 'qwen/qwen3.8-27b';
             this._disableGroqThinking = config.disableGroqThinking === true;
 
             // Load local AI settings
@@ -778,6 +818,8 @@ export class MainView extends LitElement {
             this._whisperModel = prefs.whisperModel || 'tiny.en';
 
             this.requestUpdate();
+            if (this._geminiKey) this._refreshModels('gemini');
+            if (this._groqKey) this._refreshModels('groq');
         } catch (e) {
             console.error('Error loading MainView storage:', e);
         }
@@ -936,13 +978,74 @@ export class MainView extends LitElement {
         this._geminiKey = val;
         this._keyError = false;
         await cheatingDaddy.storage.setApiKey(val);
+        this._modelCatalog = { ...this._modelCatalog, gemini: null };
         this.requestUpdate();
     }
 
     async _saveGroqKey(val) {
         this._groqKey = val;
         await cheatingDaddy.storage.setGroqApiKey(val);
+        this._modelCatalog = { ...this._modelCatalog, groq: null };
         this.requestUpdate();
+    }
+
+    async _saveTranscriptionProvider(provider) {
+        this._transcriptionProvider = provider;
+        this._keyError = false;
+        await cheatingDaddy.storage.updateConfig('transcriptionProvider', provider);
+    }
+
+    async _saveScreenshotProvider(provider) {
+        this._screenshotProvider = provider;
+        await cheatingDaddy.storage.updateConfig('screenshotProvider', provider);
+    }
+
+    async _refreshModels(provider) {
+        if (this._catalogLoading[provider]) return;
+        this._catalogLoading = { ...this._catalogLoading, [provider]: true };
+        this._catalogError = { ...this._catalogError, [provider]: '' };
+        try {
+            const result = await cheatingDaddy.listModels(provider);
+            if (!result.success) throw new Error(result.error || 'Could not load models');
+            this._modelCatalog = { ...this._modelCatalog, [provider]: result.data };
+        } catch (error) {
+            this._modelCatalog = { ...this._modelCatalog, [provider]: null };
+            this._catalogError = { ...this._catalogError, [provider]: error.message };
+        } finally {
+            this._catalogLoading = { ...this._catalogLoading, [provider]: false };
+        }
+    }
+
+    _renderModelOptions(provider, kind) {
+        return (this._modelCatalog[provider]?.[kind] || []).map(model => html`<option value=${model.id}>${model.name}</option>`);
+    }
+
+    _renderModelHint(provider, kind, selected) {
+        const models = this._modelCatalog[provider]?.[kind];
+        if (!models) return '';
+        if (models.length === 0) return html`<div class="model-status">No matching models in the catalog. You can enter an ID manually.</div>`;
+        if (selected && !models.some(model => model.id === selected.trim())) {
+            return html`<div class="model-status">This ID is not in the returned catalog. It will still be tried when used.</div>`;
+        }
+        return '';
+    }
+
+    _renderCatalogStatus(provider) {
+        const catalog = this._modelCatalog[provider];
+        const count = catalog
+            ? new Set(
+                  Object.values(catalog)
+                      .flat()
+                      .map(model => model.id)
+              ).size
+            : 0;
+        return html`
+            <button class="model-refresh" @click=${() => this._refreshModels(provider)} ?disabled=${this._catalogLoading[provider]}>
+                ${this._catalogLoading[provider] ? 'Loading models...' : 'Refresh available models'}
+            </button>
+            ${this._catalogError[provider] ? html`<div class="model-status error">${this._catalogError[provider]}</div>` : ''}
+            ${catalog ? html`<div class="model-status">${count} models returned. You can also type any model ID.</div>` : ''}
+        `;
     }
 
     async _saveGeminiLiveModel(val) {
@@ -951,9 +1054,33 @@ export class MainView extends LitElement {
         this.requestUpdate();
     }
 
+    async _saveGeminiImageModel(val) {
+        this._geminiImageModel = val;
+        await cheatingDaddy.storage.updateConfig('geminiImageModel', val);
+        this.requestUpdate();
+    }
+
+    async _saveGroqSpeechModel(val) {
+        this._groqSpeechModel = val;
+        await cheatingDaddy.storage.updateConfig('groqSpeechModel', val);
+        this.requestUpdate();
+    }
+
+    async _saveGroqSpeechFallbackModel(val) {
+        this._groqSpeechFallbackModel = val;
+        await cheatingDaddy.storage.updateConfig('groqSpeechFallbackModel', val);
+        this.requestUpdate();
+    }
+
     async _saveGroqModel(val) {
         this._groqModel = val;
         await cheatingDaddy.storage.updateConfig('groqModel', val);
+        this.requestUpdate();
+    }
+
+    async _saveGroqFallbackModel(val) {
+        this._groqFallbackModel = val;
+        await cheatingDaddy.storage.updateConfig('groqFallbackModel', val);
         this.requestUpdate();
     }
 
@@ -1023,11 +1150,21 @@ export class MainView extends LitElement {
         if (this.isInitializing || this.downloadProgress.active) return;
 
         if (this._mode === 'byok') {
-            if (!this._geminiKey.trim()) {
+            const screenshotProvider = this._screenshotProvider === 'auto' ? this._transcriptionProvider : this._screenshotProvider;
+            if (
+                (this._transcriptionProvider === 'gemini' && !this._geminiKey.trim()) ||
+                (this._transcriptionProvider === 'groq' && !this._groqKey.trim()) ||
+                (screenshotProvider === 'gemini' && !this._geminiKey.trim()) ||
+                (screenshotProvider === 'groq' && !this._groqKey.trim())
+            ) {
                 this._keyError = true;
                 this.requestUpdate();
                 return;
             }
+            if (this._transcriptionProvider === 'gemini' && !this._geminiLiveModel.trim()) return;
+            if (this._transcriptionProvider === 'groq' && (!this._groqSpeechModel.trim() || !this._groqModel.trim())) return;
+            if (screenshotProvider === 'gemini' && !this._geminiImageModel.trim()) return;
+            if (screenshotProvider === 'groq' && !this._groqImageModel.trim()) return;
         } else if (this._mode === 'local') {
             if (!this._localLlmModel.trim()) {
                 return;
@@ -1106,29 +1243,25 @@ export class MainView extends LitElement {
             >
                 <canvas class="btn-aurora"></canvas>
                 <canvas class="btn-dither"></canvas>
-                ${
-                    isDownloading
-                        ? html`<span
-                              class="download-progress-fill ${hasPercentage ? '' : 'indeterminate'}"
-                              style=${hasPercentage ? `width: ${percentage}%` : ''}
-                          ></span>`
-                        : ''
-                }
+                ${isDownloading
+                    ? html`<span
+                          class="download-progress-fill ${hasPercentage ? '' : 'indeterminate'}"
+                          style=${hasPercentage ? `width: ${percentage}%` : ''}
+                      ></span>`
+                    : ''}
                 <span class="btn-label">
                     ${isDownloading ? (hasPercentage ? `${percentage}%` : 'Preparing...') : 'Start Session'}
                     ${isDownloading ? '' : html`<span class="shortcut-hint">${isMac ? cmdIcon : ctrlIcon}${enterIcon}</span>`}
                 </span>
             </button>
-            ${
-                isDownloading
-                    ? html`
-                          <div class="download-controls">
-                              <span>Downloading: ${this.downloadProgress.label || 'Local AI files'}</span>
-                              <button class="download-cancel" @click=${() => this.onCancelDownload()}>Cancel</button>
-                          </div>
-                      `
-                    : ''
-            }
+            ${isDownloading
+                ? html`
+                      <div class="download-controls">
+                          <span>Downloading: ${this.downloadProgress.label || 'Local AI files'}</span>
+                          <button class="download-cancel" @click=${() => this.onCancelDownload()}>Cancel</button>
+                      </div>
+                  `
+                : ''}
         `;
     }
 
@@ -1157,49 +1290,106 @@ export class MainView extends LitElement {
     }
 
     _renderByokMode() {
+        const screenshotProvider = this._screenshotProvider === 'auto' ? this._transcriptionProvider : this._screenshotProvider;
         return html`
             <details class="config-section">
                 <summary class="config-summary">
                     <span class="config-summary-text">
                         <span class="config-summary-title">Transcription</span>
-                        <span class="config-summary-description">Gemini Live connection</span>
+                        <span class="config-summary-description"
+                            >${this._transcriptionProvider === 'groq' ? 'Groq Whisper' : 'Gemini Live'} connection</span
+                        >
                     </span>
                     ${this._renderConfigChevron()}
                 </summary>
                 <div class="config-content">
                     <div class="form-group">
-                        <label class="form-label">Gemini API Key</label>
-                        <input
-                            type="password"
-                            placeholder="Required"
-                            .value=${this._geminiKey}
-                            @input=${e => this._saveGeminiKey(e.target.value)}
-                            class=${this._keyError ? 'error' : ''}
-                        />
-                        <div class="form-hint">
-                            <span class="link" @click=${() => this.onExternalLink('https://aistudio.google.com/apikey')}>Get Gemini key</span>
-                        </div>
+                        <label class="form-label">Speech provider</label>
+                        <select .value=${this._transcriptionProvider} @change=${e => this._saveTranscriptionProvider(e.target.value)}>
+                            <option value="gemini">Gemini Live (free tier available)</option>
+                            <option value="groq">Groq Whisper (no Google key needed)</option>
+                        </select>
                     </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Gemini Live Model</label>
-                        <input type="text" .value=${this._geminiLiveModel} @input=${e => this._saveGeminiLiveModel(e.target.value)} />
-                    </div>
+                    ${this._transcriptionProvider === 'gemini'
+                        ? html`
+                              <div class="form-group">
+                                  <label class="form-label">Gemini API Key</label>
+                                  <input
+                                      type="password"
+                                      placeholder="Required"
+                                      .value=${this._geminiKey}
+                                      @input=${e => this._saveGeminiKey(e.target.value)}
+                                      class=${this._keyError ? 'error' : ''}
+                                  />
+                                  <div class="form-hint">
+                                      <span class="link" @click=${() => this.onExternalLink('https://aistudio.google.com/apikey')}
+                                          >Get Gemini key</span
+                                      >
+                                  </div>
+                              </div>
+                              <div class="form-group">
+                                  <label class="form-label">Gemini Live Model</label>
+                                  <input
+                                      type="text"
+                                      list="gemini-live-models"
+                                      .value=${this._geminiLiveModel}
+                                      @input=${e => this._saveGeminiLiveModel(e.target.value)}
+                                  />
+                                  <datalist id="gemini-live-models">${this._renderModelOptions('gemini', 'live')}</datalist>
+                                  ${this._renderModelHint('gemini', 'live', this._geminiLiveModel)}
+                              </div>
+                              ${this._renderCatalogStatus('gemini')}
+                          `
+                        : html`
+                              <div class="form-group">
+                                  <label class="form-label">Groq Whisper model</label>
+                                  <input
+                                      type="text"
+                                      list="groq-speech-models"
+                                      .value=${this._groqSpeechModel}
+                                      @input=${e => this._saveGroqSpeechModel(e.target.value)}
+                                  />
+                                  <datalist id="groq-speech-models">${this._renderModelOptions('groq', 'speech')}</datalist>
+                                  ${this._renderModelHint('groq', 'speech', this._groqSpeechModel)}
+                              </div>
+                              <div class="form-group">
+                                  <label class="form-label">Whisper fallback model</label>
+                                  <input
+                                      type="text"
+                                      list="groq-speech-models"
+                                      placeholder="Optional"
+                                      .value=${this._groqSpeechFallbackModel}
+                                      @input=${e => this._saveGroqSpeechFallbackModel(e.target.value)}
+                                  />
+                                  ${this._renderModelHint('groq', 'speech', this._groqSpeechFallbackModel)}
+                              </div>
+                              <div class="config-note">
+                                  Groq transcribes short audio segments and sends the text to your response model. A Groq key below is required.
+                              </div>
+                          `}
                 </div>
             </details>
 
             <details class="config-section">
                 <summary class="config-summary">
                     <span class="config-summary-text">
-                        <span class="config-summary-title">AI responses</span>
-                        <span class="config-summary-description">Groq key and response model</span>
+                        <span class="config-summary-title">AI responses and screenshots</span>
+                        <span class="config-summary-description">Groq answers and image provider</span>
                     </span>
                     ${this._renderConfigChevron()}
                 </summary>
                 <div class="config-content">
                     <div class="form-group">
                         <label class="form-label">Groq API Key</label>
-                        <input type="password" placeholder="Optional" .value=${this._groqKey} @input=${e => this._saveGroqKey(e.target.value)} />
+                        <input
+                            type="password"
+                            placeholder=${this._transcriptionProvider === 'groq' || screenshotProvider === 'groq'
+                                ? 'Required for selected providers'
+                                : 'Optional'}
+                            .value=${this._groqKey}
+                            @input=${e => this._saveGroqKey(e.target.value)}
+                            class=${this._keyError && (this._transcriptionProvider === 'groq' || screenshotProvider === 'groq') ? 'error' : ''}
+                        />
                         <div class="form-hint">
                             <span class="link" @click=${() => this.onExternalLink('https://console.groq.com/keys')}>Get Groq key</span>
                         </div>
@@ -1207,13 +1397,81 @@ export class MainView extends LitElement {
 
                     <div class="form-group">
                         <label class="form-label">Groq Model</label>
-                        <input type="text" .value=${this._groqModel} @input=${e => this._saveGroqModel(e.target.value)} />
+                        <input type="text" list="groq-chat-models" .value=${this._groqModel} @input=${e => this._saveGroqModel(e.target.value)} />
+                        <datalist id="groq-chat-models">${this._renderModelOptions('groq', 'chat')}</datalist>
+                        ${this._renderModelHint('groq', 'chat', this._groqModel)}
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Groq answer fallback model</label>
+                        <input
+                            type="text"
+                            list="groq-chat-models"
+                            placeholder="Optional"
+                            .value=${this._groqFallbackModel}
+                            @input=${e => this._saveGroqFallbackModel(e.target.value)}
+                        />
+                        ${this._renderModelHint('groq', 'chat', this._groqFallbackModel)}
                     </div>
 
+                    ${this._renderCatalogStatus('groq')}
+
                     <div class="form-group">
-                        <label class="form-label">Groq Image Model</label>
-                        <input type="text" .value=${this._groqImageModel} @input=${e => this._saveGroqImageModel(e.target.value)} />
+                        <label class="form-label">Screenshot provider</label>
+                        <select .value=${this._screenshotProvider} @change=${e => this._saveScreenshotProvider(e.target.value)}>
+                            <option value="auto">Same as speech provider</option>
+                            <option value="groq">Groq</option>
+                            <option value="gemini">Gemini</option>
+                        </select>
                     </div>
+                    ${screenshotProvider === 'groq'
+                        ? html`
+                              <div class="form-group">
+                                  <label class="form-label">Groq screenshot model</label>
+                                  <input
+                                      type="text"
+                                      list="groq-image-models"
+                                      .value=${this._groqImageModel}
+                                      @input=${e => this._saveGroqImageModel(e.target.value)}
+                                  />
+                                  <datalist id="groq-image-models">${this._renderModelOptions('groq', 'image')}</datalist>
+                                  ${this._renderModelHint('groq', 'image', this._groqImageModel)}
+                              </div>
+                              <div class="model-status">
+                                  The Groq catalog does not identify vision support or free-tier access. Choose a vision model; provider errors appear
+                                  when used.
+                              </div>
+                          `
+                        : html`
+                              ${this._transcriptionProvider === 'groq'
+                                  ? html`
+                                        <div class="form-group">
+                                            <label class="form-label">Gemini API Key for screenshots</label>
+                                            <input
+                                                type="password"
+                                                placeholder="Required for Gemini screenshots"
+                                                .value=${this._geminiKey}
+                                                @input=${e => this._saveGeminiKey(e.target.value)}
+                                                class=${this._keyError ? 'error' : ''}
+                                            />
+                                        </div>
+                                    `
+                                  : ''}
+                              <div class="form-group">
+                                  <label class="form-label">Gemini screenshot model</label>
+                                  <input
+                                      type="text"
+                                      list="gemini-image-models"
+                                      .value=${this._geminiImageModel}
+                                      @input=${e => this._saveGeminiImageModel(e.target.value)}
+                                  />
+                                  <datalist id="gemini-image-models">${this._renderModelOptions('gemini', 'image')}</datalist>
+                                  ${this._renderModelHint('gemini', 'image', this._geminiImageModel)}
+                              </div>
+                              <div class="model-status">
+                                  The Gemini catalog lists generation models but does not guarantee image input or free-tier access for every entry.
+                              </div>
+                              ${this._transcriptionProvider === 'groq' ? this._renderCatalogStatus('gemini') : ''}
+                          `}
 
                     <label class="config-checkbox">
                         <input
@@ -1228,7 +1486,9 @@ export class MainView extends LitElement {
                     </label>
 
                     <div class="config-note">
-                        If the Groq API key is empty, Gemini Live is used for answers instead. Its answer quality may be lower.
+                        ${this._transcriptionProvider === 'gemini'
+                            ? 'If the Groq API key is empty, Gemini Live is used for answers instead.'
+                            : 'Groq handles transcription and answers in this mode. Screenshots use the selected provider.'}
                     </div>
                 </div>
             </details>
@@ -1265,18 +1525,16 @@ export class MainView extends LitElement {
                             ${LOCAL_LLM_PRESETS.map(preset => html`<option value=${preset.value}>${preset.label}</option>`)}
                             <option value="custom">Custom Hugging Face model or local GGUF…</option>
                         </select>
-                        ${
-                            this._useCustomLocalLlmModel
-                                ? html`
-                                      <input
-                                          type="text"
-                                          placeholder="owner/repository:quant or /absolute/model.gguf"
-                                          .value=${this._localLlmModel}
-                                          @input=${event => this._saveLocalLlmModel(event.target.value)}
-                                      />
-                                  `
-                                : ''
-                        }
+                        ${this._useCustomLocalLlmModel
+                            ? html`
+                                  <input
+                                      type="text"
+                                      placeholder="owner/repository:quant or /absolute/model.gguf"
+                                      .value=${this._localLlmModel}
+                                      @input=${event => this._saveLocalLlmModel(event.target.value)}
+                                  />
+                              `
+                            : ''}
                         <div class="form-hint">Sizes include the vision model. Q4 uses less memory; Q8 preserves more quality.</div>
                     </div>
                 </div>
@@ -1297,11 +1555,15 @@ export class MainView extends LitElement {
                             ${this.whisperDownloading ? html`<div class="whisper-spinner"></div>` : ''}
                         </div>
                         <select .value=${this._whisperModel} @change=${e => this._saveWhisperModel(e.target.value)}>
-                            <option value="tiny.en" ?selected=${this._whisperModel === 'tiny.en'}>Tiny English (75 MB, fastest)</option>
-                            <option value="base.en" ?selected=${this._whisperModel === 'base.en'}>Base English (142 MB)</option>
-                            <option value="small.en" ?selected=${this._whisperModel === 'small.en'}>Small English (466 MB, most accurate)</option>
+                            <option value="tiny.en" ?selected=${this._whisperModel === 'tiny.en'}>Tiny (75 MB, fastest)</option>
+                            <option value="base.en" ?selected=${this._whisperModel === 'base.en'}>Base (142 MB)</option>
+                            <option value="small.en" ?selected=${this._whisperModel === 'small.en'}>Small (466 MB, most accurate)</option>
                         </select>
-                        <div class="form-hint">${this.whisperDownloading ? 'Downloading model...' : 'Downloaded automatically on first use'}</div>
+                        <div class="form-hint">
+                            ${this.whisperDownloading
+                                ? 'Downloading model...'
+                                : 'English uses the English model; other languages use the matching multilingual model. Downloaded automatically on first use.'}
+                        </div>
                     </div>
                 </div>
             </details>
@@ -1331,16 +1593,14 @@ export class MainView extends LitElement {
 
         return html`
             <div class="form-wrapper">
-                ${
-                    this._mode === 'local'
-                        ? html`
-                              <div class="title-row">
-                                  <div class="page-title">Cheating Daddy <span class="mode-suffix">Local AI</span></div>
-                                  <button class="help-btn" @click=${this._openLocalHelp} aria-label="Open Local AI help">${helpIcon}</button>
-                              </div>
-                          `
-                        : html` <div class="page-title">${html`Cheating Daddy <span class="mode-suffix">BYOK</span>`}</div> `
-                }
+                ${this._mode === 'local'
+                    ? html`
+                          <div class="title-row">
+                              <div class="page-title">Cheating Daddy <span class="mode-suffix">Local AI</span></div>
+                              <button class="help-btn" @click=${this._openLocalHelp} aria-label="Open Local AI help">${helpIcon}</button>
+                          </div>
+                      `
+                    : html` <div class="page-title">${html`Cheating Daddy <span class="mode-suffix">BYOK</span>`}</div> `}
                 <div class="page-subtitle">${this._mode === 'byok' ? 'Bring your own API keys' : 'Run models locally on your machine'}</div>
 
                 <!-- Cloud mode render branch intentionally disabled. -->

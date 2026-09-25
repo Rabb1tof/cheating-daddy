@@ -6,6 +6,7 @@ const { app, BrowserWindow, shell, ipcMain } = require('electron');
 const { createWindow, updateGlobalShortcuts } = require('./utils/window');
 const { setupGeminiIpcHandlers, stopMacOSAudioCapture, sendToRenderer } = require('./utils/gemini');
 const storage = require('./storage');
+const { listModels } = require('./utils/modelCatalog');
 
 const geminiSessionRef = { current: null };
 let mainWindow = null;
@@ -134,6 +135,14 @@ function setupStorageIpcHandlers() {
             return { success: true };
         } catch (error) {
             console.error('Error setting Groq API key:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('models:list', async (event, provider) => {
+        try {
+            return { success: true, data: await listModels(provider) };
+        } catch (error) {
             return { success: false, error: error.message };
         }
     });

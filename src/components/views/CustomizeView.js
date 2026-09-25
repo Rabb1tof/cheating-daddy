@@ -206,7 +206,7 @@ export class CustomizeView extends LitElement {
         this.onLanguageChange = () => {};
         this.onImageQualityChange = () => {};
         this.onLayoutModeChange = () => {};
-        this.googleSearchEnabled = true;
+        this.googleSearchEnabled = false;
         this.isClearing = false;
         this.isRestoring = false;
         this.clearStatusMessage = '';
@@ -219,6 +219,14 @@ export class CustomizeView extends LitElement {
         this._loadFromStorage();
     }
 
+    updated(changedProperties) {
+        super.updated(changedProperties);
+        if (changedProperties.has('selectedLanguage')) {
+            const languageSelect = this.shadowRoot.querySelector('#conversation-language');
+            if (languageSelect) languageSelect.value = this.selectedLanguage;
+        }
+    }
+
     getThemes() {
         return cheatingDaddy.theme.getAll();
     }
@@ -226,7 +234,7 @@ export class CustomizeView extends LitElement {
     async _loadFromStorage() {
         try {
             const [prefs, keybinds] = await Promise.all([cheatingDaddy.storage.getPreferences(), cheatingDaddy.storage.getKeybinds()]);
-            this.googleSearchEnabled = prefs.googleSearchEnabled ?? true;
+            this.googleSearchEnabled = prefs.googleSearchEnabled ?? false;
             this.backgroundTransparency = prefs.backgroundTransparency ?? 0.8;
             this.fontSize = prefs.fontSize ?? 20;
             this.audioMode = prefs.audioMode ?? 'speaker_only';
@@ -580,9 +588,9 @@ export class CustomizeView extends LitElement {
                             <option value="both">Both Speaker and Microphone</option>
                         </select>
                     </div>
-                    ${this.audioMode !== 'speaker_only' ? html`
-                        <div class="warning-callout">May cause unexpected behavior. Only change this if you know what you're doing.</div>
-                    ` : ''}
+                    ${this.audioMode !== 'speaker_only'
+                        ? html` <div class="warning-callout">May cause unexpected behavior. Only change this if you know what you're doing.</div> `
+                        : ''}
                     <div class="form-group">
                         <label class="form-label">Image Quality</label>
                         <select class="control" .value=${this.selectedImageQuality} @change=${this.handleImageQualitySelect}>
@@ -602,10 +610,16 @@ export class CustomizeView extends LitElement {
                 <div class="surface-title">Language</div>
                 <div class="form-grid">
                     <div class="form-group">
-                        <label class="form-label">Speech Language</label>
-                        <select class="control" .value=${this.selectedLanguage} @change=${this.handleLanguageSelect}>
-                            ${this.getLanguages().map(language => html`<option value=${language.value}>${language.name}</option>`)}
+                        <label class="form-label">Conversation Language</label>
+                        <select id="conversation-language" class="control" @change=${this.handleLanguageSelect}>
+                            ${this.getLanguages().map(
+                                language =>
+                                    html`<option value=${language.value} ?selected=${language.value === this.selectedLanguage}>
+                                        ${language.name}
+                                    </option>`
+                            )}
                         </select>
+                        <div class="form-hint">Used for answers and supported speech features. Takes effect when you start a new session.</div>
                     </div>
                 </div>
             </section>
@@ -662,20 +676,22 @@ export class CustomizeView extends LitElement {
         return html`
             <section class="surface">
                 <div class="surface-title">Keyboard Shortcuts</div>
-                ${this.getKeybindActions().map(action => html`
-                    <div class="keybind-row">
-                        <span class="keybind-name">${action.name}</span>
-                        <input
-                            type="text"
-                            class="control keybind-input"
-                            .value=${this.keybinds[action.key]}
-                            data-action=${action.key}
-                            @keydown=${this.handleKeybindInput}
-                            @focus=${this.handleKeybindFocus}
-                            readonly
-                        />
-                    </div>
-                `)}
+                ${this.getKeybindActions().map(
+                    action => html`
+                        <div class="keybind-row">
+                            <span class="keybind-name">${action.name}</span>
+                            <input
+                                type="text"
+                                class="control keybind-input"
+                                .value=${this.keybinds[action.key]}
+                                data-action=${action.key}
+                                @keydown=${this.handleKeybindInput}
+                                @focus=${this.handleKeybindFocus}
+                                readonly
+                            />
+                        </div>
+                    `
+                )}
                 <div style="margin-top: var(--space-sm);">
                     <button class="control" style="width:auto;padding:8px 10px;" @click=${this.resetKeybinds}>Reset to defaults</button>
                 </div>
@@ -695,9 +711,9 @@ export class CustomizeView extends LitElement {
                         ${this.isClearing ? 'Clearing...' : 'Delete all data'}
                     </button>
                 </div>
-                ${this.clearStatusMessage ? html`
-                    <div class="status ${this.clearStatusType === 'success' ? 'success' : 'error'}">${this.clearStatusMessage}</div>
-                ` : ''}
+                ${this.clearStatusMessage
+                    ? html` <div class="status ${this.clearStatusType === 'success' ? 'success' : 'error'}">${this.clearStatusMessage}</div> `
+                    : ''}
             </section>
         `;
     }
@@ -707,10 +723,7 @@ export class CustomizeView extends LitElement {
             <div class="unified-page">
                 <div class="unified-wrap">
                     <div class="page-title">Settings</div>
-                    ${this.renderAudioSection()}
-                    ${this.renderLanguageSection()}
-                    ${this.renderAppearanceSection()}
-                    ${this.renderKeyboardSection()}
+                    ${this.renderAudioSection()} ${this.renderLanguageSection()} ${this.renderAppearanceSection()} ${this.renderKeyboardSection()}
                     ${this.renderPrivacySection()}
                 </div>
             </div>

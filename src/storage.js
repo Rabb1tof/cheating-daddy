@@ -9,9 +9,15 @@ const DEFAULT_CONFIG = {
     configVersion: CONFIG_VERSION,
     onboarded: false,
     layout: 'normal',
-    geminiLiveModel: 'gemini-3.1-flash-live-preview',
-    groqModel: 'qwen/qwen3.6-27b',
-    groqImageModel: 'qwen/qwen3.6-27b',
+    transcriptionProvider: 'gemini',
+    screenshotProvider: 'auto',
+    geminiLiveModel: 'gemini-3.8-live',
+    geminiImageModel: 'gemini-3.8-flash',
+    groqSpeechModel: 'whisper-large-v3-turbo',
+    groqSpeechFallbackModel: 'whisper-large-v3',
+    groqModel: 'qwen/qwen3.8-27b',
+    groqFallbackModel: 'openai/gpt-oss-20b',
+    groqImageModel: 'qwen/qwen3.8-27b',
     disableGroqThinking: true,
 };
 
@@ -166,7 +172,12 @@ function initializeStorage() {
 
 function getConfig() {
     const saved = readJsonFile(getConfigPath(), {});
-    return { ...DEFAULT_CONFIG, ...saved };
+    const config = { ...DEFAULT_CONFIG, ...saved };
+    // Replace the former bundled defaults without changing manually selected IDs.
+    if (config.geminiLiveModel === 'gemini-3.1-flash-live-preview') config.geminiLiveModel = DEFAULT_CONFIG.geminiLiveModel;
+    if (config.groqModel === 'qwen/qwen3.6-27b') config.groqModel = DEFAULT_CONFIG.groqModel;
+    if (config.groqImageModel === 'qwen/qwen3.6-27b') config.groqImageModel = DEFAULT_CONFIG.groqImageModel;
+    return config;
 }
 
 function setConfig(config) {
@@ -348,7 +359,8 @@ function incrementCharUsage(provider, model, charCount) {
     const today = getTodayDateString();
     const todayEntry = limits.data.find(entry => entry.date === today);
 
-    if (todayEntry[provider] && todayEntry[provider][model]) {
+    if (todayEntry?.[provider] && typeof model === 'string' && model && Number.isFinite(charCount) && charCount > 0) {
+        todayEntry[provider][model] ||= { chars: 0 };
         todayEntry[provider][model].chars += charCount;
         setLimits(limits);
     }

@@ -106,14 +106,14 @@ export class AICustomizeView extends LitElement {
                                 </select>
                             </div>
                             <div class="form-group vertical">
-                                <label class="form-label">Custom Instructions</label>
+                                <label class="form-label">Resume, job description and instructions</label>
                                 <textarea
                                     class="control"
-                                    placeholder="Resume details, role requirements, constraints..."
+                                    placeholder="Paste your resume, the job description, and anything the AI should emphasize..."
                                     .value=${this._context}
                                     @input=${e => this._saveContext(e.target.value)}
                                 ></textarea>
-                                <div class="form-help">Sent as context at session start. Keep it short.</div>
+                                <div class="form-help">Used from the next session. Groq text reads up to 1,800 characters in concise mode or 4,000 in detailed mode; screenshots may use less to fit the free-tier token budget. Gemini screenshots read up to 4,000 characters. Put the most relevant details first.</div>
                             </div>
                         </div>
                     </section>

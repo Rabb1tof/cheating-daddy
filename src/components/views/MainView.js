@@ -839,6 +839,7 @@ export class MainView extends LitElement {
         _groqKey: { state: true },
         _openaiKey: { state: true },
         _transcriptionProvider: { state: true },
+        _responseProvider: { state: true },
         _screenshotProvider: { state: true },
         _geminiLiveModel: { state: true },
         _geminiImageModel: { state: true },
@@ -883,6 +884,7 @@ export class MainView extends LitElement {
         this._groqKey = '';
         this._openaiKey = '';
         this._transcriptionProvider = 'gemini';
+        this._responseProvider = 'auto';
         this._screenshotProvider = 'auto';
         this._geminiLiveModel = 'gemini-3.8-live';
         this._geminiImageModel = 'gemini-3.8-flash';
@@ -938,6 +940,7 @@ export class MainView extends LitElement {
             this._groqKey = (await cheatingDaddy.storage.getGroqApiKey().catch(() => '')) || '';
             this._openaiKey = creds.openaiKey || '';
             this._transcriptionProvider = config.transcriptionProvider === 'groq' ? 'groq' : 'gemini';
+            this._responseProvider = ['auto', 'gemini', 'groq'].includes(config.responseProvider) ? config.responseProvider : 'auto';
             this._screenshotProvider = ['auto', 'gemini', 'groq'].includes(config.screenshotProvider) ? config.screenshotProvider : 'auto';
             this._geminiLiveModel = config.geminiLiveModel || 'gemini-3.8-live';
             this._geminiImageModel = config.geminiImageModel || 'gemini-3.8-flash';
@@ -1139,6 +1142,13 @@ export class MainView extends LitElement {
         this._transcriptionProvider = provider;
         this._keyError = false;
         await cheatingDaddy.storage.updateConfig('transcriptionProvider', provider);
+    }
+
+    async _saveResponseProvider(provider) {
+        if (!['auto', 'gemini', 'groq'].includes(provider)) return;
+        this._responseProvider = provider;
+        this._keyError = false;
+        await cheatingDaddy.storage.updateConfig('responseProvider', provider);
     }
 
     async _saveScreenshotProvider(provider) {
@@ -1545,9 +1555,11 @@ export class MainView extends LitElement {
 
         if (this._mode === 'byok') {
             const screenshotProvider = this._screenshotProvider === 'auto' ? this._transcriptionProvider : this._screenshotProvider;
+            const responseProvider = this._transcriptionProvider === 'groq' || this._responseProvider === 'groq' ? 'groq' : 'gemini';
             if (
                 (this._transcriptionProvider === 'gemini' && !this._geminiKey.trim()) ||
                 (this._transcriptionProvider === 'groq' && !this._groqKey.trim()) ||
+                (responseProvider === 'groq' && !this._groqKey.trim()) ||
                 (screenshotProvider === 'gemini' && !this._geminiKey.trim()) ||
                 (screenshotProvider === 'groq' && !this._groqKey.trim())
             ) {
@@ -1556,7 +1568,8 @@ export class MainView extends LitElement {
                 return;
             }
             if (this._transcriptionProvider === 'gemini' && !this._geminiLiveModel.trim()) return;
-            if (this._transcriptionProvider === 'groq' && (!this._groqSpeechModel.trim() || !this._groqModel.trim())) return;
+            if (this._transcriptionProvider === 'groq' && !this._groqSpeechModel.trim()) return;
+            if (responseProvider === 'groq' && !this._groqModel.trim()) return;
             if (screenshotProvider === 'gemini' && !this._geminiImageModel.trim()) return;
             if (screenshotProvider === 'groq' && !this._groqImageModel.trim()) return;
         } else if (this._mode === 'local') {
@@ -1685,6 +1698,7 @@ export class MainView extends LitElement {
 
     _renderByokMode() {
         const screenshotProvider = this._screenshotProvider === 'auto' ? this._transcriptionProvider : this._screenshotProvider;
+        const responseProvider = this._transcriptionProvider === 'groq' || this._responseProvider === 'groq' ? 'groq' : 'gemini';
         return html`
             <details class="config-section">
                 <summary class="config-summary">
@@ -1779,7 +1793,7 @@ export class MainView extends LitElement {
                 <summary class="config-summary">
                     <span class="config-summary-text">
                         <span class="config-summary-title">AI responses and screenshots</span>
-                        <span class="config-summary-description">Groq answers and image provider</span>
+                        <span class="config-summary-description">${responseProvider === 'groq' ? 'Groq' : 'Gemini Live'} answers and image provider</span>
                     </span>
                     ${this._renderConfigChevron()}
                 </summary>
@@ -1787,13 +1801,25 @@ export class MainView extends LitElement {
                     ${this._transcriptionProvider === 'gemini'
                         ? html`
                               <div class="form-group">
+                                  <label class="form-label">Answer provider</label>
+                                  <select .value=${this._responseProvider} @change=${e => this._saveResponseProvider(e.target.value)}>
+                                      <option value="auto">Same as speech provider (Gemini Live)</option>
+                                      <option value="gemini">Gemini Live</option>
+                                      <option value="groq">Groq (Gemini Live transcription)</option>
+                                  </select>
+                              </div>
+                          `
+                        : ''}
+                    ${this._transcriptionProvider === 'gemini'
+                        ? html`
+                              <div class="form-group">
                                   <label class="form-label">Groq API Key</label>
                                   <input
                                       type="password"
-                                      placeholder=${screenshotProvider === 'groq' ? 'Required for Groq screenshots' : 'Optional for Groq responses'}
+                                       placeholder=${responseProvider === 'groq' ? 'Required for Groq answers' : screenshotProvider === 'groq' ? 'Required for Groq screenshots' : 'Optional'}
                                       .value=${this._groqKey}
                                       @input=${e => this._saveGroqKey(e.target.value)}
-                                      class=${this._keyError && screenshotProvider === 'groq' ? 'error' : ''}
+                                       class=${this._keyError && (responseProvider === 'groq' || screenshotProvider === 'groq') ? 'error' : ''}
                                   />
                                   <div class="form-hint">
                                       <span class="link" @click=${() => this.onExternalLink('https://console.groq.com/keys')}>Get Groq key</span>
@@ -1890,7 +1916,9 @@ export class MainView extends LitElement {
 
                     <div class="config-note">
                         ${this._transcriptionProvider === 'gemini'
-                            ? 'If the Groq API key is empty, Gemini Live is used for answers instead.'
+                            ? responseProvider === 'groq'
+                                ? 'Gemini Live transcribes speech; Groq generates the visible answers. A Groq key and response model are required. This hybrid uses both providers\u2019 quotas because Gemini Live still processes and generates audio.'
+                                : 'Gemini Live transcribes speech and generates answers. Saving a Groq key for screenshots does not change this.'
                             : 'Groq handles transcription and answers in this mode. Screenshots use the selected provider.'}
                     </div>
                 </div>

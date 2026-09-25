@@ -224,16 +224,104 @@ function buildSystemPrompt(promptParts, customPrompt = '', googleSearchEnabled =
     return sections.join('');
 }
 
-function getSystemPrompt(profile, customPrompt = '', googleSearchEnabled = true, language = 'en-US') {
+const detailedFormatRequirements = `**RESPONSE FORMAT REQUIREMENTS:**
+- Give a direct, natural answer that the user can speak aloud.
+- For substantive interview questions, aim for 4-6 meaningful sentences with a concrete example or explanation when the supplied context supports one.
+- A simple question may need only a brief answer; do not pad it to reach a sentence count.
+- Use markdown for readability, with bold emphasis sparingly and bullets only when a list is useful.
+- Use facts from the user-provided context. Never invent employers, years of experience, achievements, numbers, responsibilities, technologies, or facts about the vacancy or company.`;
+
+const detailedProfileGuidance = {
+    interview: `Connect relevant skills and real achievements in the user's resume to the requirements in the vacancy. Explain how that experience would help in the role. If the context lacks a relevant fact, answer honestly without making up first-person experience.`,
+    sales: `Explain the value and address the prospect's question or objection with enough detail to be useful. Do not invent customers, results, prices, or product capabilities.`,
+    meeting: `Give a clear response with the reasoning and next steps that are supported by the context. Do not invent project status, owners, dates, or figures.`,
+    presentation: `Explain the point and its significance in spoken language. Cite specific figures only when they appear in the supplied context or verified search results.`,
+    negotiation: `Address the concern and explain a practical option or tradeoff. Do not invent terms, discounts, benchmarks, or commitments.`,
+    exam: `Answer the question directly and explain the reasoning when it helps. Keep simple factual answers brief, and expand only when the question requires it.`,
+};
+
+function detailedIntro(profile, promptParts) {
+    if (profile === 'interview') {
+        return `You are an AI-powered interview assistant acting as an on-screen teleprompter. Help the user formulate accurate, natural, ready-to-speak answers tailored to their background and the role.`;
+    }
+    if (profile === 'exam') {
+        return `You are an exam assistant. Give accurate answers and explain the reasoning when the question calls for it.`;
+    }
+    return promptParts.intro;
+}
+
+function detailedOutputInstructions(profile) {
+    return profile === 'exam'
+        ? `**OUTPUT INSTRUCTIONS:** Provide the answer and a useful explanation in markdown. Match the length to the question. Do not add unsupported facts.`
+        : `**OUTPUT INSTRUCTIONS:** Provide the words the user can say in markdown. Explain the point clearly and stay grounded in the supplied context. Do not add coaching or claim experience the user has not provided.`;
+}
+
+function buildDetailedSystemPrompt(profile, promptParts, customPrompt, googleSearchEnabled, language) {
+    const responseLanguage = typeof language === 'string' && /^[a-z]{2,3}-[A-Z]{2}$/.test(language) ? language : 'en-US';
+    const languageName = new Intl.DisplayNames(['en'], { type: 'language' }).of(responseLanguage.split('-')[0]);
+    const sections = [detailedIntro(profile, promptParts), '\n\n', detailedFormatRequirements];
+    if (googleSearchEnabled) {
+        sections.push(
+            '\n\n',
+            `**SEARCH TOOL USAGE:** Use Google search for recent events, company-specific facts, current industry trends, regulations, or other information that may have changed. Ground current claims in the results.`
+        );
+    }
+    sections.push(
+        '\n\n',
+        detailedProfileGuidance[profile],
+        '\n\nUser-provided context\n-----\n',
+        customPrompt,
+        '\n-----\n\n',
+        detailedOutputInstructions(profile),
+        `\n\n**RESPONSE LANGUAGE:** Write every answer in ${languageName} (${responseLanguage}).`
+    );
+    return sections.join('');
+}
+
+function getSystemPrompt(profile, customPrompt = '', googleSearchEnabled = true, language = 'en-US', responseStyle = 'concise') {
     const promptParts = profilePrompts[profile] || profilePrompts.interview;
+    if (responseStyle === 'detailed') {
+        const effectiveProfile = profilePrompts[profile] ? profile : 'interview';
+        return buildDetailedSystemPrompt(effectiveProfile, promptParts, customPrompt, googleSearchEnabled, language);
+    }
     return buildSystemPrompt(promptParts, customPrompt, googleSearchEnabled, language);
 }
 
-function getCompactSystemPrompt(profile, customPrompt = '', language = 'en-US') {
+function compactContext(value, maxCharacters, maxBytes) {
+    const raw = String(value || '');
+    const characters = [];
+    let bytes = 0;
+    for (const character of raw) {
+        const size = Buffer.byteLength(character, 'utf8');
+        if (characters.length >= maxCharacters || bytes + size > maxBytes) break;
+        characters.push(character);
+        bytes += size;
+    }
+    const text = characters.join('');
+    return { text, truncated: text.length < raw.length };
+}
+
+function getCompactSystemPrompt(profile, customPrompt = '', language = 'en-US', responseStyle = 'concise') {
     const promptParts = profilePrompts[profile] || profilePrompts.interview;
     const responseLanguage = typeof language === 'string' && /^[a-z]{2,3}-[A-Z]{2}$/.test(language) ? language : 'en-US';
     const languageName = new Intl.DisplayNames(['en'], { type: 'language' }).of(responseLanguage.split('-')[0]);
-    const context = String(customPrompt || '').slice(0, 1800);
+    if (responseStyle === 'detailed') {
+        const effectiveProfile = profilePrompts[profile] ? profile : 'interview';
+        const bounded = compactContext(customPrompt, 4000, 6000);
+        const context = bounded.text;
+        const truncationNotice = bounded.truncated ? '\n[User context truncated after 4000 characters or to fit the request budget; rely only on the text above.]' : '';
+        return [
+            detailedIntro(effectiveProfile, promptParts),
+            detailedFormatRequirements,
+            detailedProfileGuidance[effectiveProfile],
+            detailedOutputInstructions(effectiveProfile),
+            context ? `User context:\n${context}${truncationNotice}` : '',
+            `Write every answer in ${languageName} (${responseLanguage}).`,
+        ]
+            .filter(Boolean)
+            .join('\n\n');
+    }
+    const context = compactContext(customPrompt, 1800, 4000).text;
     return [
         promptParts.intro,
         promptParts.formatRequirements,
@@ -245,8 +333,51 @@ function getCompactSystemPrompt(profile, customPrompt = '', language = 'en-US') 
         .join('\n\n');
 }
 
+function getScreenshotSystemPrompt(profile, context = '', language = 'en-US', responseStyle = 'concise', maxContextBytes = Infinity) {
+    const responseLanguage = typeof language === 'string' && /^[a-z]{2,3}-[A-Z]{2}$/.test(language) ? language : 'en-US';
+    const languageName = new Intl.DisplayNames(['en'], { type: 'language' }).of(responseLanguage.split('-')[0]);
+    const rawContext = String(context || '');
+    const characterLimit = responseStyle === 'detailed' ? 4000 : 1800;
+    const byteLimit = Number.isFinite(maxContextBytes) ? Math.max(0, Math.floor(maxContextBytes)) : Infinity;
+    const characters = [];
+    let byteCount = 0;
+    let truncated = false;
+    for (const character of rawContext) {
+        const characterBytes = Buffer.byteLength(character, 'utf8');
+        if (characters.length >= characterLimit || byteCount + characterBytes > byteLimit) {
+            truncated = true;
+            break;
+        }
+        characters.push(character);
+        byteCount += characterBytes;
+    }
+
+    const instructions = [
+        `You are analyzing a screenshot. Follow the user's specific request and the visible content.`,
+        `For code requests, provide the complete requested code without placeholders. If the output limit interrupts it, clearly mark the answer incomplete.`,
+        `For multiple-choice questions, identify the correct option and reproduce its label and text exactly as displayed. If text is unreadable, say so instead of guessing.`,
+        profile === 'interview'
+            ? `For interview questions, use only factual resume achievements and vacancy requirements from the supplied context to tailor the answer. Never invent employers, experience, numbers, company facts, or screenshot content.`
+            : `Use the supplied context when relevant. Never invent facts or unreadable screenshot content.`,
+        responseStyle === 'detailed'
+            ? `Explain reasoning when it helps with the task. A substantive interview answer can be 4-6 natural sentences; a simple question or exact choice can be brief.`
+            : `Keep straightforward explanations brief, while still fully answering the request.`,
+        `Write explanations in ${languageName} (${responseLanguage}); preserve code, identifiers, and quoted answer choices.`,
+    ];
+    if (rawContext) {
+        const includedContext = characters.join('');
+        instructions.push(
+            includedContext
+                ? `User-provided context:\n${includedContext}${truncated ? '\n[Context truncated; use only the text above.]' : ''}`
+                : `User-provided context was omitted to fit the request budget.`
+        );
+    }
+    return instructions.join('\n\n');
+}
+
 module.exports = {
     profilePrompts,
     getSystemPrompt,
     getCompactSystemPrompt,
+    getScreenshotSystemPrompt,
 };

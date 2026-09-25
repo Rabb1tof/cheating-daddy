@@ -1,11 +1,12 @@
 const WebSocket = require('ws');
 const { BrowserWindow } = require('electron');
+const { createResponseStream } = require('./responseStream');
 
 let cloudWs = null;
 let isCloudConnected = false;
 let currentCloudResponse = '';
+let currentCloudStream = null;
 let currentTranscription = '';
-let isFirstChunk = true;
 let audioChunkCount = 0;
 let onTurnComplete = null;
 
@@ -29,6 +30,9 @@ function connectCloud(token, profile, userContext) {
     }
 
     audioChunkCount = 0;
+    currentCloudResponse = '';
+    currentCloudStream = null;
+    currentTranscription = '';
 
     return new Promise((resolve, reject) => {
         const url = `wss://api.cheatingdaddy.com/ws?token=${encodeURIComponent(token)}`;
@@ -99,14 +103,16 @@ function handleMessage(msg) {
             break;
 
         case 'response_start':
+            // The cloud protocol has no turn ID, so we can identify only the
+            // response currently being streamed by the server.
             currentCloudResponse = '';
-            isFirstChunk = true;
+            currentCloudStream = createResponseStream(sendToRenderer);
             break;
 
         case 'response_chunk':
+            if (!currentCloudStream) currentCloudStream = createResponseStream(sendToRenderer);
             currentCloudResponse += msg.text;
-            sendToRenderer(isFirstChunk ? 'new-response' : 'update-response', currentCloudResponse);
-            isFirstChunk = false;
+            currentCloudStream.update(currentCloudResponse);
             break;
 
         case 'response_end':
@@ -114,6 +120,7 @@ function handleMessage(msg) {
                 onTurnComplete(currentTranscription, currentCloudResponse);
             }
             currentTranscription = '';
+            currentCloudStream = null;
             sendToRenderer('update-status', 'Listening...');
             break;
 
@@ -182,8 +189,8 @@ function closeCloud() {
     }
     isCloudConnected = false;
     currentCloudResponse = '';
+    currentCloudStream = null;
     currentTranscription = '';
-    isFirstChunk = true;
     audioChunkCount = 0;
     onTurnComplete = null;
 }

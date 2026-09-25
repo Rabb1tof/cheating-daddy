@@ -1,7 +1,9 @@
 const fs = require('fs');
 const path = require('path');
 const { getSystemPrompt } = require('./prompts');
+const { getPreferences } = require('../storage');
 const { sendToRenderer, initializeNewSession, saveConversationTurn } = require('./gemini');
+const { createResponseStream } = require('./responseStream');
 const {
     ensureNativeBinary,
     ensureLlamaModel,
@@ -24,6 +26,14 @@ let currentWhisperLanguage = 'en';
 let isLocalActive = false;
 let initializationController = null;
 let llamaCacheSnapshot = new Set();
+let completionController = null;
+let completionQueue = Promise.resolve();
+let interruptLocalOnNewRequest = false;
+let rememberLocalRecentAnswers = true;
+const pendingCompletionControllers = new Set();
+const LOCAL_HISTORY_TURNS = 3;
+const LOCAL_HISTORY_QUESTION_BYTES = 240;
+const LOCAL_HISTORY_ANSWER_BYTES = 360;
 
 let isSpeaking = false;
 let speechBuffers = [];
@@ -160,6 +170,7 @@ async function transcribeAudio(pcm16kBuffer) {
 
 async function handleSpeechEnd(audioData) {
     if (!isLocalActive) return;
+    const sessionController = completionController;
 
     if (audioData.length < 16000) {
         console.log('[LocalAI] Audio too short, skipping');
@@ -169,6 +180,7 @@ async function handleSpeechEnd(audioData) {
 
     try {
         const transcription = await transcribeAudio(audioData);
+        if (!isLocalActive || sessionController !== completionController || sessionController?.signal.aborted) return;
 
         if (!transcription || transcription.length < 2) {
             console.log('[LocalAI] Empty transcription, skipping');
@@ -179,8 +191,11 @@ async function handleSpeechEnd(audioData) {
         sendToRenderer('update-status', 'Generating response...');
         await sendToLlama(transcription);
     } catch (error) {
+        if (error.message === 'Interrupted by a new request') return;
         console.error('[LocalAI] Transcription error:', error);
-        sendToRenderer('update-status', 'Transcription error: ' + error.message);
+        if (isLocalActive && sessionController === completionController && !sessionController?.signal.aborted) {
+            sendToRenderer('update-status', 'Transcription error: ' + error.message);
+        }
     }
 }
 
@@ -212,7 +227,61 @@ async function readStreamingResponse(response, onText) {
     return fullText;
 }
 
-async function requestLlama(messages, onText) {
+function enqueueCompletion(task) {
+    const sessionController = completionController;
+    if (interruptLocalOnNewRequest) {
+        for (const previous of pendingCompletionControllers) previous.abort(new Error('Interrupted by a new request'));
+    }
+    const requestController = new AbortController();
+    const onSessionClosed = () => requestController.abort(new Error('Local session closed'));
+    if (sessionController?.signal.aborted) onSessionClosed();
+    else sessionController?.signal.addEventListener('abort', onSessionClosed, { once: true });
+    pendingCompletionControllers.add(requestController);
+    const pending = completionQueue.then(async () => {
+        if (!isLocalActive || sessionController !== completionController || requestController.signal.aborted) {
+            throw requestController.signal.reason || new Error('Local session closed');
+        }
+        try {
+            return await task(requestController.signal);
+        } catch (error) {
+            if (requestController.signal.aborted) throw requestController.signal.reason || error;
+            throw error;
+        }
+    }).finally(() => {
+        pendingCompletionControllers.delete(requestController);
+        sessionController?.signal.removeEventListener('abort', onSessionClosed);
+    });
+    completionQueue = pending.catch(() => {});
+    return pending;
+}
+
+function clipHistoryText(value, maxBytes) {
+    const text = String(value || '');
+    if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+    const suffix = '…';
+    const contentLimit = maxBytes - Buffer.byteLength(suffix, 'utf8');
+    let clipped = '';
+    let bytes = 0;
+    for (const character of text) {
+        const characterBytes = Buffer.byteLength(character, 'utf8');
+        if (bytes + characterBytes > contentLimit) break;
+        clipped += character;
+        bytes += characterBytes;
+    }
+    return clipped.trimEnd() + suffix;
+}
+
+function recentLocalTurns() {
+    if (!rememberLocalRecentAnswers) return [];
+    // Only completed turns are stored. Three pairs use at most 1,800 UTF-8 bytes,
+    // leaving room in llama.cpp's 8,192-token window for the current input and output.
+    return localConversationHistory.slice(-LOCAL_HISTORY_TURNS * 2).map(message => ({
+        role: message.role,
+        content: clipHistoryText(message.content, message.role === 'assistant' ? LOCAL_HISTORY_ANSWER_BYTES : LOCAL_HISTORY_QUESTION_BYTES),
+    }));
+}
+
+async function requestLlama(messages, onText, signal) {
     if (!llamaBaseUrl) {
         throw new Error('Llama server is not running');
     }
@@ -220,6 +289,7 @@ async function requestLlama(messages, onText) {
     const response = await fetch(`${llamaBaseUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal,
         body: JSON.stringify({
             model: 'local',
             messages,
@@ -236,41 +306,39 @@ async function requestLlama(messages, onText) {
         throw new Error(`Llama server returned HTTP ${response.status}: ${errorText}`);
     }
 
-    return readStreamingResponse(response, onText);
+    const text = await readStreamingResponse(response, onText);
+    if (signal.aborted) throw new Error('Local session closed');
+    return text;
 }
 
 async function sendToLlama(transcription) {
-    localConversationHistory.push({
-        role: 'user',
-        content: transcription.trim(),
-    });
-
-    if (localConversationHistory.length > 20) {
-        localConversationHistory = localConversationHistory.slice(-20);
-    }
-
+    const sessionController = completionController;
     try {
-        const messages = [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...localConversationHistory];
+        return await enqueueCompletion(async signal => {
+            const userMessage = { role: 'user', content: transcription.trim() };
+            const recentTurns = recentLocalTurns();
+            const messages = [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...recentTurns, userMessage];
+            const stream = createResponseStream(sendToRenderer);
+            const fullText = await requestLlama(messages, text => {
+                if (!signal.aborted) stream.update(text);
+            }, signal);
 
-        let isFirst = true;
-        const fullText = await requestLlama(messages, text => {
-            sendToRenderer(isFirst ? 'new-response' : 'update-response', text);
-            isFirst = false;
+            if (fullText.trim()) {
+                localConversationHistory.push(userMessage, { role: 'assistant', content: fullText.trim() });
+                localConversationHistory = localConversationHistory.slice(-20);
+                saveConversationTurn(transcription, fullText);
+            }
+
+            console.log('[LocalAI] Llama response completed');
+            sendToRenderer('update-status', 'Listening...');
+            return fullText;
         });
-
-        if (fullText.trim()) {
-            localConversationHistory.push({
-                role: 'assistant',
-                content: fullText.trim(),
-            });
-            saveConversationTurn(transcription, fullText);
-        }
-
-        console.log('[LocalAI] Llama response completed');
-        sendToRenderer('update-status', 'Listening...');
     } catch (error) {
+        if (error.message === 'Interrupted by a new request') throw error;
         console.error('[LocalAI] Llama error:', error);
-        sendToRenderer('update-status', 'Local AI error: ' + error.message);
+        if (isLocalActive && sessionController === completionController && !sessionController?.signal.aborted) {
+            sendToRenderer('update-status', 'Local AI error: ' + error.message);
+        }
         throw error;
     }
 }
@@ -437,7 +505,10 @@ async function initializeLocalSession(model, whisperModel, profile, customPrompt
                 : whisperModel;
         initializationController = new AbortController();
         llamaCacheSnapshot = getDirectoryEntries(path.join(getModelsDirectory(), 'llama'));
-        currentSystemPrompt = getSystemPrompt(profile, customPrompt, false, selectedLanguage);
+        const responseStyle = getPreferences().responseStyle === 'detailed' ? 'detailed' : 'concise';
+        interruptLocalOnNewRequest = getPreferences().interruptOnNewRequest === true;
+        rememberLocalRecentAnswers = getPreferences().rememberRecentAnswers !== false;
+        currentSystemPrompt = getSystemPrompt(profile, customPrompt, false, selectedLanguage, responseStyle);
         llamaModel = model;
 
         const nativeFiles = await prepareNativeFiles(model, effectiveWhisperModel, initializationController.signal);
@@ -460,6 +531,8 @@ async function initializeLocalSession(model, whisperModel, profile, customPrompt
 
         initializeNewSession(profile, customPrompt);
         isLocalActive = true;
+        completionController = new AbortController();
+        completionQueue = Promise.resolve();
         initializationController = null;
         sendToRenderer('local-ai-download-progress', { active: false });
         sendToRenderer('session-initializing', false);
@@ -495,6 +568,11 @@ function processLocalAudio(monoChunk24k) {
 
 function closeLocalSession() {
     isLocalActive = false;
+    completionController?.abort();
+    completionController = null;
+    completionQueue = Promise.resolve();
+    pendingCompletionControllers.clear();
+    interruptLocalOnNewRequest = false;
     initializationController?.abort();
     initializationController = null;
     stopNativeServer(llamaProcess);
@@ -542,6 +620,7 @@ async function sendLocalText(text) {
         await sendToLlama(text);
         return { success: true };
     } catch (error) {
+        if (error.message === 'Interrupted by a new request') return { success: true, interrupted: true };
         return { success: false, error: error.message };
     }
 }
@@ -564,35 +643,32 @@ async function sendLocalImage(base64Data, prompt) {
         ],
     };
 
-    localConversationHistory.push({ role: 'user', content: prompt });
-    if (localConversationHistory.length > 20) {
-        localConversationHistory = localConversationHistory.slice(-20);
-    }
-
+    const sessionController = completionController;
     try {
-        sendToRenderer('update-status', 'Analyzing image...');
-        const messages = [
-            { role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' },
-            ...localConversationHistory.slice(0, -1),
-            userMessage,
-        ];
+        return await enqueueCompletion(async signal => {
+            sendToRenderer('update-status', 'Analyzing image...');
+            const recentTurns = recentLocalTurns();
+            const messages = [{ role: 'system', content: currentSystemPrompt || 'You are a helpful assistant.' }, ...recentTurns, userMessage];
+            const stream = createResponseStream(sendToRenderer);
+            const fullText = await requestLlama(messages, text => {
+                if (!signal.aborted) stream.update(text);
+            }, signal);
 
-        let isFirst = true;
-        const fullText = await requestLlama(messages, text => {
-            sendToRenderer(isFirst ? 'new-response' : 'update-response', text);
-            isFirst = false;
+            if (fullText.trim()) {
+                localConversationHistory.push({ role: 'user', content: prompt }, { role: 'assistant', content: fullText.trim() });
+                localConversationHistory = localConversationHistory.slice(-20);
+                saveConversationTurn(prompt, fullText);
+            }
+
+            sendToRenderer('update-status', 'Listening...');
+            return { success: true, text: fullText, model: llamaModel };
         });
-
-        if (fullText.trim()) {
-            localConversationHistory.push({ role: 'assistant', content: fullText.trim() });
-            saveConversationTurn(prompt, fullText);
-        }
-
-        sendToRenderer('update-status', 'Listening...');
-        return { success: true, text: fullText, model: llamaModel };
     } catch (error) {
+        if (error.message === 'Interrupted by a new request') return { success: true, interrupted: true, model: llamaModel };
         console.error('[LocalAI] Image error:', error);
-        sendToRenderer('update-status', 'Local AI image error: ' + error.message);
+        if (isLocalActive && sessionController === completionController && !sessionController?.signal.aborted) {
+            sendToRenderer('update-status', 'Local AI image error: ' + error.message);
+        }
         return { success: false, error: error.message };
     }
 }

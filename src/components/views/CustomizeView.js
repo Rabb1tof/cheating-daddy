@@ -178,6 +178,9 @@ export class CustomizeView extends LitElement {
     static properties = {
         selectedProfile: { type: String },
         selectedLanguage: { type: String },
+        responseStyle: { type: String },
+        interruptOnNewRequest: { type: Boolean },
+        rememberRecentAnswers: { type: Boolean },
         selectedImageQuality: { type: String },
         layoutMode: { type: String },
         keybinds: { type: Object },
@@ -199,6 +202,9 @@ export class CustomizeView extends LitElement {
         super();
         this.selectedProfile = 'interview';
         this.selectedLanguage = 'en-US';
+        this.responseStyle = 'concise';
+        this.interruptOnNewRequest = false;
+        this.rememberRecentAnswers = true;
         this.selectedImageQuality = 'medium';
         this.layoutMode = 'normal';
         this.keybinds = this.getDefaultKeybinds();
@@ -239,6 +245,9 @@ export class CustomizeView extends LitElement {
             this.fontSize = prefs.fontSize ?? 20;
             this.audioMode = prefs.audioMode ?? 'speaker_only';
             this.customPrompt = prefs.customPrompt ?? '';
+            this.responseStyle = prefs.responseStyle === 'detailed' ? 'detailed' : 'concise';
+            this.interruptOnNewRequest = prefs.interruptOnNewRequest === true;
+            this.rememberRecentAnswers = prefs.rememberRecentAnswers !== false;
             this.theme = prefs.theme ?? 'dark';
             if (keybinds) {
                 this.keybinds = { ...this.getDefaultKeybinds(), ...keybinds };
@@ -361,6 +370,21 @@ export class CustomizeView extends LitElement {
     async handleCustomPromptInput(e) {
         this.customPrompt = e.target.value;
         await cheatingDaddy.storage.updatePreference('customPrompt', this.customPrompt);
+    }
+
+    async handleResponseStyleChange(e) {
+        this.responseStyle = e.target.checked ? 'detailed' : 'concise';
+        await cheatingDaddy.storage.updatePreference('responseStyle', this.responseStyle);
+    }
+
+    async handleInterruptOnNewRequestChange(e) {
+        this.interruptOnNewRequest = e.target.checked;
+        await cheatingDaddy.storage.updatePreference('interruptOnNewRequest', this.interruptOnNewRequest);
+    }
+
+    async handleRememberRecentAnswersChange(e) {
+        this.rememberRecentAnswers = e.target.checked;
+        await cheatingDaddy.storage.updatePreference('rememberRecentAnswers', this.rememberRecentAnswers);
     }
 
     async handleAudioModeSelect(e) {
@@ -489,6 +513,9 @@ export class CustomizeView extends LitElement {
             // Restore all preferences to defaults
             const defaults = {
                 customPrompt: '',
+                responseStyle: 'concise',
+                interruptOnNewRequest: false,
+                rememberRecentAnswers: true,
                 selectedProfile: 'interview',
                 selectedLanguage: 'en-US',
                 selectedScreenshotInterval: '5',
@@ -520,6 +547,9 @@ export class CustomizeView extends LitElement {
             this.backgroundTransparency = defaults.backgroundTransparency;
             this.googleSearchEnabled = defaults.googleSearchEnabled;
             this.customPrompt = defaults.customPrompt;
+            this.responseStyle = defaults.responseStyle;
+            this.interruptOnNewRequest = defaults.interruptOnNewRequest;
+            this.rememberRecentAnswers = defaults.rememberRecentAnswers;
             this.theme = defaults.theme;
 
             // Notify parent callbacks
@@ -626,6 +656,50 @@ export class CustomizeView extends LitElement {
         `;
     }
 
+    renderResponseSection() {
+        return html`
+            <section class="surface">
+                <div class="surface-title">Responses</div>
+                <div class="form-grid">
+                    <label class="toggle-row">
+                        <input
+                            class="toggle-input"
+                            type="checkbox"
+                            .checked=${this.responseStyle === 'detailed'}
+                            @change=${this.handleResponseStyleChange}
+                        />
+                        <span class="toggle-label">Detailed answers</span>
+                    </label>
+                    <div class="form-hint">Adds more detail from your AI Context. Takes effect when you start a new session and uses more output tokens.</div>
+                    <label class="toggle-row">
+                        <input
+                            class="toggle-input"
+                            type="checkbox"
+                            .checked=${this.interruptOnNewRequest}
+                            @change=${this.handleInterruptOnNewRequestChange}
+                        />
+                        <span class="toggle-label">Interrupt current answer on a new request</span>
+                    </label>
+                    <div class="form-hint">
+                        When off, an answer in progress is allowed to finish. When on, new text or screenshot requests can cancel active local/HTTP answers; Gemini Live speech interrupts a Live answer and cancels a separate HTTP answer once speech is recognized. HTTP cancellation may still use quota. Cloud answers cannot be cancelled. Takes effect next session.
+                    </div>
+                    <label class="toggle-row">
+                        <input
+                            class="toggle-input"
+                            type="checkbox"
+                            .checked=${this.rememberRecentAnswers}
+                            @change=${this.handleRememberRecentAnswersChange}
+                        />
+                        <span class="toggle-label">Remember recent answers</span>
+                    </label>
+                    <div class="form-hint">
+                        Adds up to three completed answers from this session to later requests, using extra input tokens. Model context clears on session close; saved History is separate. Gemini Live keeps its own context while connected. Takes effect next session.
+                    </div>
+                </div>
+            </section>
+        `;
+    }
+
     renderAppearanceSection() {
         return html`
             <section class="surface">
@@ -723,7 +797,8 @@ export class CustomizeView extends LitElement {
             <div class="unified-page">
                 <div class="unified-wrap">
                     <div class="page-title">Settings</div>
-                    ${this.renderAudioSection()} ${this.renderLanguageSection()} ${this.renderAppearanceSection()} ${this.renderKeyboardSection()}
+                    ${this.renderAudioSection()} ${this.renderLanguageSection()} ${this.renderResponseSection()}
+                    ${this.renderAppearanceSection()} ${this.renderKeyboardSection()}
                     ${this.renderPrivacySection()}
                 </div>
             </div>

@@ -15,6 +15,12 @@ function createHarness(connectBehavior, onStatus = () => {}) {
 
     class FakeGoogleGenAI {
         constructor() {
+            this.models = {
+                generateContentStream: async () => (async function* () {
+                    yield { text: 'answer' };
+                    yield { usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 20, totalTokenCount: 120 } };
+                })(),
+            };
             this.live = {
                 webSocketFactory: {
                     create: () => ({
@@ -60,14 +66,19 @@ function createHarness(connectBehavior, onStatus = () => {}) {
             getApiKey: () => 'test-only',
             getGroqApiKey: () => '',
             incrementCharUsage: () => {},
-            getConfig: () => ({ geminiLiveModel: 'test-live' }),
+            getConfig: () => ({ geminiLiveModel: 'test-live', geminiImageModel: 'test-image' }),
             getPreferences: () => ({ googleSearchEnabled: false }),
         },
         './groqTranscription': { GroqTranscriptionSession: class {} },
         './pcm': { resample24kTo16k: () => {} },
         './modelCatalog': { listModels: () => [] },
         './groqClient': { requestGroqCompletion: () => {} },
-        './providerLimits': { getGroqLimitsGeneration: () => 0, recordGroqLimits: () => {} },
+        './providerLimits': {
+            getGroqLimitsGeneration: () => 0,
+            recordGroqLimits: () => {},
+            getGeminiUsageGeneration: () => 0,
+            recordGeminiUsage: observation => events.push({ channel: 'usage', observation }),
+        },
         './liveSetupGuard': { connectWithSetupGuard, trackLiveTransport },
         './cloud': {},
         './transportLogger': {
@@ -160,4 +171,26 @@ test('Gemini Live close clears only its own session reference', async () => {
     harness.callbacks.onclose({ code: 1008, reason: 'old socket closed again' });
     assert.deepEqual(harness.ref.current, { newer: true });
     assert.equal(harness.events.length, eventCount);
+});
+
+test('Gemini Live publishes reported token usage without counting setup messages', async () => {
+    const harness = createHarness((_callbacks, session) => Promise.resolve(session));
+    await harness.gemini.initializeGeminiSession('test-only');
+    harness.callbacks.onmessage({ usageMetadata: { promptTokenCount: 70, responseTokenCount: 20, totalTokenCount: 90 } });
+    const observations = harness.events.filter(event => event.channel === 'usage');
+    assert.equal(observations.length, 1);
+    assert.equal(observations[0].observation.kind, 'live');
+    assert.equal(observations[0].observation.model, 'test-live');
+    assert.equal(observations[0].observation.usageMetadata.totalTokenCount, 90);
+});
+
+test('Gemini screenshot stream publishes final response usage once', async () => {
+    const harness = createHarness((_callbacks, session) => Promise.resolve(session));
+    const result = await harness.gemini.sendImageToGeminiHttp('fake-base64', 'What is shown?');
+    assert.equal(result.success, true);
+    const observations = harness.events.filter(event => event.channel === 'usage');
+    assert.equal(observations.length, 1);
+    assert.equal(observations[0].observation.kind, 'image');
+    assert.equal(observations[0].observation.model, 'test-image');
+    assert.equal(observations[0].observation.usageMetadata.totalTokenCount, 120);
 });

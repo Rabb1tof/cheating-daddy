@@ -8,7 +8,7 @@ const { GroqTranscriptionSession } = require('./groqTranscription');
 const { resample24kTo16k } = require('./pcm');
 const { listModels } = require('./modelCatalog');
 const { requestGroqCompletion } = require('./groqClient');
-const { getGroqLimitsGeneration, recordGroqLimits } = require('./providerLimits');
+const { getGroqLimitsGeneration, recordGroqLimits, getGeminiUsageGeneration, recordGeminiUsage } = require('./providerLimits');
 const { trackLiveTransport, connectWithSetupGuard } = require('./liveSetupGuard');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
 const { startTransportLog, logTransportEvent, closeTransportLog } = require('./transportLogger');
@@ -214,6 +214,17 @@ function observeGroqLimitsForKey(apiKey) {
     return observation => {
         // Requests already in flight may finish after the user changes keys.
         if (getGroqApiKey()?.trim() === apiKey) recordGroqLimits(observation, generation);
+    };
+}
+
+function observeGeminiUsageForKey(apiKey, kind, model, sessionId) {
+    const generation = getGeminiUsageGeneration();
+    return usageMetadata => {
+        if (getApiKey()?.trim() !== apiKey.trim()) return;
+        recordGeminiUsage(
+            { provider: 'gemini', kind, model, sessionId, observedAt: Date.now(), usageMetadata },
+            generation
+        );
     };
 }
 
@@ -505,6 +516,7 @@ async function sendToGemma(transcription) {
 
     const trimmedHistory = trimConversationHistoryForGemma(groqConversationHistory, 42000);
 
+    const observeUsage = observeGeminiUsageForKey(apiKey, 'text', 'gemma-4-26b-a4b-it', currentSessionId);
     try {
         const ai = new GoogleGenAI({ apiKey: apiKey });
 
@@ -527,8 +539,10 @@ async function sendToGemma(transcription) {
 
         let fullText = '';
         let isFirst = true;
+        let usageMetadata = null;
 
         for await (const chunk of response) {
+            if (chunk.usageMetadata) usageMetadata = chunk.usageMetadata;
             const chunkText = chunk.text;
             if (chunkText) {
                 fullText += chunkText;
@@ -536,6 +550,7 @@ async function sendToGemma(transcription) {
                 isFirst = false;
             }
         }
+        if (usageMetadata) observeUsage(usageMetadata);
 
         const systemPromptChars = (currentSystemPrompt || 'You are a helpful assistant.').length;
         const historyChars = trimmedHistory.reduce((sum, msg) => sum + (msg.content || '').length, 0);
@@ -606,10 +621,12 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         currentSystemPrompt = systemPrompt; // Store for Groq
         currentResponseLanguage = language;
 
+        const liveModel = getConfig().geminiLiveModel;
+        const observeUsage = observeGeminiUsageForKey(apiKey, 'live', liveModel, currentSessionId);
         const session = await connectWithSetupGuard(
             guard =>
                 client.live.connect({
-                    model: getConfig().geminiLiveModel,
+                    model: liveModel,
                     callbacks: {
                         onopen: function () {
                             if (guard.isAbandoned()) return;
@@ -619,6 +636,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                             if (guard.isAbandoned()) return;
                             console.log('----------------', message);
                             logTransportEvent('gemini.live.message', message);
+                            if (message.usageMetadata) observeUsage(message.usageMetadata);
 
                             // Handle input transcription (what was spoken)
                             if (message.serverContent?.inputTranscription?.results) {
@@ -1011,6 +1029,8 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
         return { success: false, error: 'No API key configured' };
     }
 
+    if (!currentSessionId) initializeNewSession();
+    const observeUsage = observeGeminiUsageForKey(apiKey, 'image', model, currentSessionId);
     try {
         const ai = new GoogleGenAI({ apiKey: apiKey });
 
@@ -1034,7 +1054,9 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
         // Stream the response
         let fullText = '';
         let isFirst = true;
+        let usageMetadata = null;
         for await (const chunk of response) {
+            if (chunk.usageMetadata) usageMetadata = chunk.usageMetadata;
             const chunkText = chunk.text;
             if (chunkText) {
                 fullText += chunkText;
@@ -1043,6 +1065,7 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
                 isFirst = false;
             }
         }
+        if (usageMetadata) observeUsage(usageMetadata);
 
         console.log(`Image response completed from ${model}`);
 

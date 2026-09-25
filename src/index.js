@@ -7,7 +7,8 @@ const { createWindow, updateGlobalShortcuts } = require('./utils/window');
 const { setupGeminiIpcHandlers, stopMacOSAudioCapture, sendToRenderer } = require('./utils/gemini');
 const storage = require('./storage');
 const { listModels } = require('./utils/modelCatalog');
-const { getProviderLimits, subscribeProviderLimits, clearGroqLimits } = require('./utils/providerLimits');
+const { getProviderLimits, subscribeProviderLimits, clearGroqLimits, clearGeminiUsage } = require('./utils/providerLimits');
+const { getGeminiProjectQuota } = require('./utils/geminiProjectQuota');
 
 const geminiSessionRef = { current: null };
 let mainWindow = null;
@@ -95,8 +96,10 @@ function setupStorageIpcHandlers() {
     ipcMain.handle('storage:set-credentials', async (event, credentials) => {
         try {
             const oldGroqApiKey = storage.getGroqApiKey();
+            const oldGeminiApiKey = storage.getApiKey();
             storage.setCredentials(credentials);
             if (oldGroqApiKey !== storage.getGroqApiKey()) clearGroqLimits();
+            if (oldGeminiApiKey !== storage.getApiKey()) clearGeminiUsage();
             return { success: true };
         } catch (error) {
             console.error('Error setting credentials:', error);
@@ -115,7 +118,9 @@ function setupStorageIpcHandlers() {
 
     ipcMain.handle('storage:set-api-key', async (event, apiKey) => {
         try {
+            const oldGeminiApiKey = storage.getApiKey();
             storage.setApiKey(apiKey);
+            if (oldGeminiApiKey !== storage.getApiKey()) clearGeminiUsage();
             return { success: true };
         } catch (error) {
             console.error('Error setting API key:', error);
@@ -149,6 +154,14 @@ function setupStorageIpcHandlers() {
             return { success: true, data: await listModels(provider) };
         } catch (error) {
             return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('gemini-project-quota:get', async (_event, projectId, forceRefresh) => {
+        try {
+            return { success: true, data: await getGeminiProjectQuota(projectId, { forceRefresh: forceRefresh === true }) };
+        } catch (error) {
+            return { success: false, error: /valid Google Cloud project ID/.test(error.message) ? error.message : 'Could not read Gemini project quotas.' };
         }
     });
 

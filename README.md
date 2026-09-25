@@ -33,6 +33,11 @@ A real-time AI assistant that provides contextual help during video calls, inter
 2. **Install Dependencies**: `npm ci`
 3. **Run the App**: `npm start`
 
+## Installing packaged builds
+
+- **Windows**: Run the `.exe` installer. It installs for the current Windows account and appears as **Cheating Daddy** in **Settings → Apps → Installed apps**. If it is missing, check that you are viewing the same Windows account that ran the installer and that `%LOCALAPPDATA%\cheating-daddy` exists. The per-user uninstall entry is under `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\cheating-daddy`.
+- **macOS**: Open the `.dmg` and drag **Cheating Daddy.app** into **Applications**. Opening the disk image alone does not install the app; after copying, launch it from **Applications**.
+
 ## Usage
 
 1. Select **Groq** or **Gemini Live** for transcription, then enter the corresponding API key. A Groq key can also provide answers while Gemini Live handles transcription.
@@ -47,6 +52,14 @@ A real-time AI assistant that provides contextual help during video calls, inter
 Groq-only mode sends speech to Whisper and the resulting transcript to a Groq chat model. Silence and very short speech are skipped; speech is batched into segments of up to 20 seconds. Transcription requests are spaced by at least 10 seconds, text requests by at least 8 seconds, and screenshot requests by at least 30 seconds. Chat answers are capped at 512 completion tokens, screenshot answers at 1024, and context is kept short. The app marks answers cut off by these limits. A configured fallback speech or chat model is tried when the primary model is unavailable or rate limited. A rate limit shared across models can still stop both attempts; the app shows the error instead of retrying indefinitely. Check your current [Groq rate limits](https://console.groq.com/docs/rate-limits) and [model availability](https://console.groq.com/docs/models) because they vary by account and may change.
 
 Gemini Live models and their free-tier support also change. Use the model list and [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) before starting a long session. Google Search is off by default to avoid extra requests. The current Gemini 3.8 Live model keeps proactive audio enabled on the server; the API rejects an explicit `proactiveAudio: false` setting.
+
+### Provider usage and limits
+
+The Home screen shows Groq limits from the last response headers and Gemini token usage reported for requests made by this app. Gemini Live shows its latest usage report; screenshot and text totals count completed requests in the current app session. These figures are not a project-wide remaining balance.
+
+Reading Gemini **project** quotas is optional. Find your project ID in [AI Studio Projects](https://aistudio.google.com/projects), then use `gcloud auth application-default login` to authorize Google Cloud Application Default Credentials. Your Google account needs `cloudquotas.quotas.get` and `monitoring.timeSeries.list` on the project, and the [Cloud Quotas](https://cloud.google.com/docs/quotas/development-environment) and [Cloud Monitoring](https://cloud.google.com/monitoring/docs/monitoring-overview) APIs must be enabled. Enter the project ID under **Provider usage and limits** and click **Refresh**. This makes a fresh read only when clicked, without an inference request. The panel shows published **free-tier limits for the selected Gemini models**; check AI Studio for the project's actual tier. [Cloud Quotas API calls are free](https://cloud.google.com/quotas/pricing). Cloud Monitoring may require a billing-enabled project even when API calls would fall within its [monthly free allotment](https://cloud.google.com/products/observability/pricing); without billing, free-tier quota limits and this app's token counts still work. When available, Monitoring usage is displayed by sample interval because it can lag and is not an instant remaining balance.
+
+The Gemini and Groq providers work with their own API keys even if you do not set up Google Cloud sign-in.
 
 ## Keyboard Shortcuts
 

@@ -119,6 +119,10 @@ async function getProviderLimits() {
     return ipcRenderer.invoke('provider-limits:get');
 }
 
+async function getGeminiProjectQuota(projectId, forceRefresh = false) {
+    return ipcRenderer.invoke('gemini-project-quota:get', projectId, forceRefresh);
+}
+
 function onProviderLimitsUpdated(callback) {
     if (typeof callback !== 'function') throw new TypeError('callback must be a function');
     const listener = (_event, state) => callback(state);
@@ -1153,6 +1157,7 @@ const cheatingDaddy = {
     storage,
     listModels,
     getProviderLimits,
+    getGeminiProjectQuota,
     onProviderLimitsUpdated,
 
     // Theme API

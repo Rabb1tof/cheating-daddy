@@ -59,6 +59,8 @@ jobs:
           plutil -extract NSAudioCaptureUsageDescription raw -o - "$app/Contents/Info.plist"
           test -s "$app/Contents/Resources/LICENSE"
           test "$(lipo -archs "$app/Contents/Resources/SystemAudioDump")" = arm64
+          codesign --verify --verbose=2 "$app/Contents/Resources/SystemAudioDump"
+          codesign --verify --deep --strict --verbose=2 "$app"
           dmg=$(find out/make -maxdepth 1 -type f -name '*.dmg' -print -quit)
           test -s "$dmg"
           shasum -a 256 "$dmg" | sed "s#out/make/##" > out/make/SHA256SUMS-macos.txt

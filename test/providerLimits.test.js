@@ -6,6 +6,9 @@ const {
     getGroqLimitsGeneration,
     clearGroqLimits,
     recordGroqLimits,
+    getGeminiUsageGeneration,
+    clearGeminiUsage,
+    recordGeminiUsage,
 } = require('../src/utils/providerLimits');
 
 function observation(kind, model, observedAt) {
@@ -46,9 +49,9 @@ test('key rotation clears observations and ignores old in-flight responses', () 
     const generation = getGroqLimitsGeneration();
     recordGroqLimits(observation('chat', 'old', 100), generation);
     clearGroqLimits();
-    assert.deepEqual(getProviderLimits(), { groq: [] });
+    assert.deepEqual(getProviderLimits().groq, []);
     assert.equal(recordGroqLimits(observation('chat', 'old', 200), generation), false);
-    assert.deepEqual(getProviderLimits(), { groq: [] });
+    assert.deepEqual(getProviderLimits().groq, []);
 });
 
 test('retains only 12 most recent distinct observations', () => {
@@ -58,4 +61,60 @@ test('retains only 12 most recent distinct observations', () => {
     assert.equal(models.length, 12);
     assert.equal(models.includes('model-0'), false);
     assert.equal(models[0], 'model-12');
+});
+
+function geminiObservation(kind, model, sessionId, observedAt, usageMetadata) {
+    return { provider: 'gemini', kind, model, sessionId, observedAt, usageMetadata, apiKey: 'must-never-be-exposed' };
+}
+
+test('Gemini Live retains the latest reported snapshot rather than summing server messages', () => {
+    clearGeminiUsage();
+    recordGeminiUsage(geminiObservation('live', 'live-a', 'session-1', 100, {
+        promptTokenCount: 120,
+        responseTokenCount: 40,
+        totalTokenCount: 160,
+    }));
+    recordGeminiUsage(geminiObservation('live', 'live-a', 'session-1', 200, {
+        promptTokenCount: 150,
+        responseTokenCount: 50,
+        totalTokenCount: 200,
+    }));
+    const [latest] = getProviderLimits().gemini;
+    assert.equal(latest.totalTokenCount, 200);
+    assert.equal(latest.candidatesTokenCount, 50);
+    assert.equal(latest.observationCount, 2);
+    assert.equal(JSON.stringify(latest).includes('must-never-be-exposed'), false);
+});
+
+test('Gemini HTTP totals sum distinct completed requests within each session', () => {
+    clearGeminiUsage();
+    recordGeminiUsage(geminiObservation('image', 'image-a', 'session-1', 100, {
+        promptTokenCount: 100,
+        candidatesTokenCount: 30,
+        totalTokenCount: 130,
+    }));
+    recordGeminiUsage(geminiObservation('image', 'image-a', 'session-1', 200, {
+        promptTokenCount: 80,
+        candidatesTokenCount: 20,
+        totalTokenCount: 100,
+    }));
+    recordGeminiUsage(geminiObservation('image', 'image-a', 'session-2', 300, {
+        totalTokenCount: 50,
+    }));
+    const bySession = Object.fromEntries(getProviderLimits().gemini.map(item => [item.sessionId, item]));
+    assert.equal(bySession['session-1'].totalTokenCount, 230);
+    assert.equal(bySession['session-1'].promptTokenCount, 180);
+    assert.equal(bySession['session-1'].observationCount, 2);
+    assert.equal(bySession['session-2'].totalTokenCount, 50);
+    assert.equal(bySession['session-2'].promptTokenCount, null);
+});
+
+test('Gemini key rotation clears observations and rejects old requests', () => {
+    clearGeminiUsage();
+    const generation = getGeminiUsageGeneration();
+    recordGeminiUsage(geminiObservation('text', 'model-a', null, 100, { totalTokenCount: 10 }), generation);
+    clearGeminiUsage();
+    assert.deepEqual(getProviderLimits().gemini, []);
+    assert.equal(recordGeminiUsage(geminiObservation('text', 'model-a', null, 200, { totalTokenCount: 10 }), generation), false);
+    assert.deepEqual(getProviderLimits().gemini, []);
 });

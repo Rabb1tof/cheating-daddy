@@ -13,6 +13,7 @@ const DEFAULT_CONFIG = {
     screenshotProvider: 'auto',
     geminiLiveModel: 'gemini-3.8-live',
     geminiImageModel: 'gemini-3.8-flash',
+    geminiProjectId: '',
     groqSpeechModel: 'whisper-large-v3-turbo',
     groqSpeechFallbackModel: 'whisper-large-v3',
     groqModel: 'qwen/qwen3.8-27b',

@@ -24,10 +24,11 @@ export class MainView extends LitElement {
 
         :host {
             height: 100%;
+            box-sizing: border-box;
             display: flex;
             flex-direction: column;
             align-items: center;
-            justify-content: center;
+            justify-content: safe center;
             padding: var(--space-xl) var(--space-lg);
         }
 
@@ -228,6 +229,109 @@ export class MainView extends LitElement {
 
         .limits-observation strong {
             color: var(--text-primary);
+        }
+
+        .limits-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .limits-group-title {
+            color: var(--text-primary);
+            font-size: var(--font-size-sm);
+            font-weight: var(--font-weight-semibold);
+        }
+
+        .limits-card {
+            padding: 10px 12px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background: var(--bg-elevated);
+            overflow-wrap: anywhere;
+        }
+
+        .limits-card-header {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            gap: 4px 10px;
+            align-items: baseline;
+            margin-bottom: 8px;
+        }
+
+        .limits-card-header strong {
+            color: var(--text-primary);
+            font-size: var(--font-size-xs);
+        }
+
+        .limits-card-meta {
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+        }
+
+        .limits-metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+            gap: 7px;
+        }
+
+        .limits-metric {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            min-width: 0;
+            font-size: var(--font-size-xs);
+        }
+
+        .limits-metric-label {
+            color: var(--text-muted);
+        }
+
+        .limits-metric-value {
+            color: var(--text-primary);
+            font-weight: var(--font-weight-medium);
+        }
+
+        .limits-meter {
+            height: 4px;
+            width: 100%;
+            appearance: none;
+            border: 0;
+            border-radius: 4px;
+            background: var(--border);
+        }
+
+        .limits-meter::-webkit-progress-bar {
+            border-radius: 4px;
+            background: var(--border);
+        }
+
+        .limits-meter::-webkit-progress-value {
+            border-radius: 4px;
+            background: var(--accent);
+        }
+
+        .limits-card-note {
+            margin-top: 8px;
+            color: var(--text-muted);
+            font-size: var(--font-size-xs);
+            line-height: var(--line-height);
+        }
+
+        .limits-project-controls {
+            display: flex;
+            gap: 8px;
+            align-items: stretch;
+        }
+
+        .limits-project-controls input {
+            min-width: 0;
+            flex: 1;
+        }
+
+        .limits-project-controls button {
+            flex: none;
         }
 
         .config-checkbox {
@@ -738,6 +842,10 @@ export class MainView extends LitElement {
         _screenshotProvider: { state: true },
         _geminiLiveModel: { state: true },
         _geminiImageModel: { state: true },
+        _geminiProjectId: { state: true },
+        _geminiProjectQuota: { state: true },
+        _geminiProjectQuotaLoading: { state: true },
+        _geminiProjectQuotaError: { state: true },
         _groqSpeechModel: { state: true },
         _groqSpeechFallbackModel: { state: true },
         _groqModel: { state: true },
@@ -778,6 +886,10 @@ export class MainView extends LitElement {
         this._screenshotProvider = 'auto';
         this._geminiLiveModel = 'gemini-3.8-live';
         this._geminiImageModel = 'gemini-3.8-flash';
+        this._geminiProjectId = '';
+        this._geminiProjectQuota = null;
+        this._geminiProjectQuotaLoading = false;
+        this._geminiProjectQuotaError = '';
         this._groqSpeechModel = 'whisper-large-v3-turbo';
         this._groqSpeechFallbackModel = 'whisper-large-v3';
         this._groqModel = 'qwen/qwen3.8-27b';
@@ -787,7 +899,7 @@ export class MainView extends LitElement {
         this._modelCatalog = { gemini: null, groq: null };
         this._catalogLoading = { gemini: false, groq: false };
         this._catalogError = { gemini: '', groq: '' };
-        this._providerLimits = { groq: [] };
+        this._providerLimits = { groq: [], gemini: [] };
         this._limitsUnsubscribe = null;
         this._tokenError = false;
         this._keyError = false;
@@ -829,6 +941,7 @@ export class MainView extends LitElement {
             this._screenshotProvider = ['auto', 'gemini', 'groq'].includes(config.screenshotProvider) ? config.screenshotProvider : 'auto';
             this._geminiLiveModel = config.geminiLiveModel || 'gemini-3.8-live';
             this._geminiImageModel = config.geminiImageModel || 'gemini-3.8-flash';
+            this._geminiProjectId = config.geminiProjectId || '';
             this._groqSpeechModel = config.groqSpeechModel || 'whisper-large-v3-turbo';
             this._groqSpeechFallbackModel = config.groqSpeechFallbackModel || '';
             this._groqModel = config.groqModel || 'qwen/qwen3.8-27b';
@@ -1128,53 +1241,208 @@ export class MainView extends LitElement {
         return `${Math.ceil(seconds / 3600)}h`;
     }
 
+    _renderGroqMetric(label, metric, observedAt) {
+        const remaining = metric?.remaining;
+        const limit = metric?.limit;
+        const hasMeter = Number.isFinite(remaining) && Number.isFinite(limit) && limit > 0;
+        const resetAt = Number.isFinite(metric?.reset) ? observedAt + metric.reset : null;
+        return html`
+            <div class="limits-metric">
+                <span class="limits-metric-label">${label}</span>
+                <span class="limits-metric-value">${this._formatLimit(remaining)} remaining${Number.isFinite(limit) ? html` / ${this._formatLimit(limit)}` : ''}</span>
+                ${hasMeter ? html`<progress class="limits-meter" max=${limit} value=${Math.min(limit, remaining)}></progress>` : ''}
+                ${resetAt ? html`<span class="limits-metric-label">Reset reported for ${new Date(resetAt).toLocaleTimeString()}</span>` : ''}
+            </div>
+        `;
+    }
+
+    _renderGeminiUsageMetric(label, value) {
+        if (!Number.isFinite(value)) return '';
+        return html`
+            <div class="limits-metric">
+                <span class="limits-metric-label">${label}</span>
+                <span class="limits-metric-value">${this._formatLimit(value)}</span>
+            </div>
+        `;
+    }
+
+    async _saveGeminiProjectId() {
+        const projectId = this._geminiProjectId.trim();
+        this._geminiProjectId = projectId;
+        this._geminiProjectQuota = null;
+        this._geminiProjectQuotaError = '';
+        await cheatingDaddy.storage.updateConfig('geminiProjectId', projectId);
+    }
+
+    async _refreshGeminiProjectQuota(forceRefresh = false) {
+        const projectId = this._geminiProjectId.trim();
+        if (!projectId) {
+            this._geminiProjectQuotaError = 'Enter the Google Cloud project ID first.';
+            return;
+        }
+        if (this._geminiProjectQuotaLoading) return;
+        this._geminiProjectQuotaLoading = true;
+        this._geminiProjectQuotaError = '';
+        try {
+            const result = await cheatingDaddy.getGeminiProjectQuota(projectId, forceRefresh);
+            if (!result.success) throw new Error(result.error || 'Could not read project quotas');
+            if (projectId === this._geminiProjectId.trim()) this._geminiProjectQuota = result.data;
+        } catch (error) {
+            if (projectId === this._geminiProjectId.trim()) this._geminiProjectQuotaError = error.message;
+        } finally {
+            this._geminiProjectQuotaLoading = false;
+        }
+    }
+
+    _renderGeminiProjectQuota() {
+        const snapshot = this._geminiProjectQuota;
+        const selectedModels = new Set([this._geminiLiveModel.trim(), this._geminiImageModel.trim()]);
+        const prioritizeModel = item => (selectedModels.has(item.model) ? 0 : 1);
+        const quotaRows = (snapshot?.quotas || [])
+            .filter(quota => selectedModels.has(quota.model) && /free.?tier/i.test(quota.quotaId || '') && Number.isFinite(quota.limit) && quota.kind)
+            .sort((left, right) => prioritizeModel(left) - prioritizeModel(right));
+        const usageRows = [...(snapshot?.monitoring || [])].sort((left, right) => prioritizeModel(left) - prioritizeModel(right));
+        return html`
+            <div class="limits-group">
+                <div class="limits-group-title">Gemini free-tier quotas</div>
+                <div class="model-status">
+                    Project limits and usage require Google Cloud sign-in and a project ID. Cloud Quotas publishes free and paid tiers; only free-tier limits for your selected models are shown here. A missing RPM or RPD value does not mean unlimited. Refresh makes a new read. The Gemini API key cannot grant access to this dashboard.
+                    <span class="link" @click=${() => this.onExternalLink('https://aistudio.google.com/projects')}>Find project ID</span> ·
+                    <span class="link" @click=${() => this.onExternalLink('https://cloud.google.com/docs/authentication/set-up-adc-local-dev-environment')}>Set up Google Cloud sign-in</span>
+                </div>
+                <div class="limits-project-controls">
+                    <input
+                        type="text"
+                        aria-label="Google Cloud project ID"
+                        placeholder="Google Cloud project ID"
+                        .value=${this._geminiProjectId}
+                        @input=${event => {
+                            this._geminiProjectId = event.target.value;
+                            this._geminiProjectQuota = null;
+                        }}
+                        @change=${() => this._saveGeminiProjectId()}
+                    />
+                    <button class="model-refresh" @click=${() => this._refreshGeminiProjectQuota(true)} ?disabled=${this._geminiProjectQuotaLoading}>
+                        ${this._geminiProjectQuotaLoading ? 'Loading...' : 'Refresh'}
+                    </button>
+                </div>
+                ${this._geminiProjectQuotaError ? html`<div class="model-status error" role="alert">${this._geminiProjectQuotaError}</div>` : ''}
+                ${snapshot
+                    ? html`
+                          <div class="model-status">Read at ${new Date(snapshot.fetchedAt).toLocaleTimeString()}. Google Cloud usage samples may lag; numbers are not an instant remaining balance.</div>
+                          ${quotaRows.length === 0 ? html`<div class="model-status">No free-tier quota values were returned for the selected models. Check AI Studio for the project's current tier and limits.</div>` : ''}
+                          ${quotaRows.slice(0, 20).map(
+                              quota => html`
+                                  <div class="limits-card">
+                                      <div class="limits-card-header">
+                                          <strong>${quota.model || 'Project'} · ${quota.displayName || quota.quotaId}</strong>
+                                          <span class="limits-card-meta">${quota.kind || 'Quota'}</span>
+                                      </div>
+                                      <div class="limits-metric">
+                                          <span class="limits-metric-label">Reported free-tier limit</span>
+                                          <span class="limits-metric-value">${this._formatLimit(quota.limit)}${quota.kind ? ` ${quota.kind.toUpperCase()}` : ''}</span>
+                                      </div>
+                                      ${quota.isPrecise === false ? html`<div class="limits-card-note">Google marks this quota as approximate.</div>` : ''}
+                                  </div>
+                              `
+                          )}
+                          ${quotaRows.length > 20 ? html`<div class="model-status">Showing 20 of ${quotaRows.length} free-tier entries. See AI Studio for the full list.</div>` : ''}
+                          ${usageRows.length > 0
+                              ? html`
+                                    <div class="limits-group-title">Google Cloud usage samples</div>
+                                    ${usageRows.slice(0, 12).map(
+                                        sample => html`
+                                            <div class="limits-card">
+                                            <div class="limits-card-header">
+                                                    <strong>${sample.model || 'Project'} · ${sample.metric?.includes('input_token') ? 'Input tokens' : 'Requests'}</strong>
+                                                    <span class="limits-card-meta">${sample.kind?.toUpperCase() || sample.limitName || 'Sample'} · ${new Date(sample.usage?.intervalEnd || sample.limit?.observedAt).toLocaleTimeString()}</span>
+                                                </div>
+                                                <div class="limits-metrics">
+                                                    ${this._renderGeminiUsageMetric('Used in sampled interval', sample.usage?.value)}
+                                                    ${this._renderGeminiUsageMetric('Reported limit', sample.limit?.value)}
+                                                </div>
+                                                ${sample.usage?.intervalStart
+                                                    ? html`<div class="limits-card-note">Sample interval: ${new Date(sample.usage.intervalStart).toLocaleTimeString()}–${new Date(sample.usage.intervalEnd).toLocaleTimeString()}.</div>`
+                                                    : ''}
+                                            </div>
+                                        `
+                                    )}
+                                    ${usageRows.length > 12 ? html`<div class="model-status">Showing 12 of ${usageRows.length} usage samples. See AI Studio for the full list.</div>` : ''}
+                                `
+                              : ''}
+                          ${(snapshot.warnings || []).map(warning => html`<div class="model-status">${warning}</div>`)}
+                      `
+                    : ''}
+            </div>
+        `;
+    }
+
     _renderProviderLimits() {
-        const observations = this._providerLimits?.groq || [];
+        const groqObservations = this._providerLimits?.groq || [];
+        const geminiObservations = this._providerLimits?.gemini || [];
         return html`
             <details class="config-section">
                 <summary class="config-summary">
                     <span class="config-summary-text">
-                        <span class="config-summary-title">Provider limits</span>
-                        <span class="config-summary-description">Latest observed Groq limits and Gemini dashboard</span>
+                        <span class="config-summary-title">Provider usage and limits</span>
+                        <span class="config-summary-description">Gemini tokens used and latest Groq response limits</span>
                     </span>
                     ${this._renderConfigChevron()}
                 </summary>
                 <div class="config-content">
-                    <div class="model-status">
-                        Gemini does not expose your remaining project quota to this API key. Check the
-                        <span class="link" @click=${() => this.onExternalLink('https://aistudio.google.com/rate-limit')}>AI Studio rate limits</span>
-                        and <span class="link" @click=${() => this.onExternalLink('https://aistudio.google.com/usage')}>usage</span> dashboards.
+                    ${this._renderGeminiProjectQuota()}
+                    <div class="limits-group">
+                        <div class="limits-group-title">Gemini</div>
+                        <div class="model-status">Token counts reported by Gemini for requests made in this app. These are usage figures, not remaining project quota.</div>
+                        ${geminiObservations.length === 0
+                            ? html`<div class="model-status">No Gemini token usage observed in this app session yet.</div>`
+                            : geminiObservations.map(
+                                  observation => html`
+                                      <div class="limits-card">
+                                          <div class="limits-card-header">
+                                              <strong>${observation.model}</strong>
+                                              <span class="limits-card-meta">${observation.kind === 'live' ? 'Live' : observation.kind === 'image' ? 'Screenshot' : 'Text'} · ${new Date(observation.observedAt).toLocaleTimeString()}</span>
+                                          </div>
+                                          <div class="limits-metrics">
+                                              ${this._renderGeminiUsageMetric('Total tokens', observation.totalTokenCount)}
+                                              ${this._renderGeminiUsageMetric('Input tokens', observation.promptTokenCount)}
+                                              ${this._renderGeminiUsageMetric('Output tokens', observation.candidatesTokenCount)}
+                                              ${this._renderGeminiUsageMetric('Thinking tokens', observation.thoughtsTokenCount)}
+                                              ${this._renderGeminiUsageMetric('Cached tokens', observation.cachedContentTokenCount)}
+                                          </div>
+                                          <div class="limits-card-note">${observation.kind === 'live' ? 'Latest Live usage report. Periodic reports are not added together.' : `${this._formatLimit(observation.observationCount)} completed request(s) in this app session.`}</div>
+                                      </div>
+                                  `
+                              )}
+                        <div class="model-status">
+                            Project RPM, TPM, and RPD quotas include other API keys and apps. View the current values in
+                            <span class="link" @click=${() => this.onExternalLink('https://aistudio.google.com/rate-limit')}>AI Studio rate limits</span>
+                            and <span class="link" @click=${() => this.onExternalLink('https://aistudio.google.com/usage')}>usage</span>.
+                        </div>
                     </div>
-                    <div class="model-status">
-                        Groq sends requests/day and tokens/minute limits with each API response. Values below are the last observed per model, not a
-                        live account total.
-                    </div>
-                    ${observations.length === 0
-                        ? html`<div class="model-status">No Groq response observed in this app session yet.</div>`
-                        : observations.map(
-                              observation => html`
-                                  <div class="limits-observation">
-                                      <strong>${observation.model}</strong> (${observation.kind}, HTTP ${observation.status}) ·
-                                      ${new Date(observation.observedAt).toLocaleTimeString()}<br />
-                                      Requests/day: ${this._formatLimit(observation.requestsPerDay?.remaining)} /
-                                      ${this._formatLimit(observation.requestsPerDay?.limit)}; tokens/minute:
-                                      ${this._formatLimit(observation.tokensPerMinute?.remaining)} /
-                                      ${this._formatLimit(observation.tokensPerMinute?.limit)}.
-                                      ${Number.isFinite(observation.requestsPerDay?.reset)
-                                          ? html`Daily reset was ${this._formatLimitDuration(observation.requestsPerDay.reset)} after that response.`
-                                          : ''}
-                                      ${Number.isFinite(observation.tokensPerMinute?.reset)
-                                          ? html`Token reset was ${this._formatLimitDuration(observation.tokensPerMinute.reset)} after that response.`
-                                          : ''}
-                                      ${Number.isFinite(observation.retryAfterMs)
-                                          ? html`Retry after ${this._formatLimitDuration(observation.retryAfterMs)} from that response.`
-                                          : ''}
-                                  </div>
-                              `
-                          )}
-                    <div class="model-status">
-                        For other Groq limits, see
-                        <span class="link" @click=${() => this.onExternalLink('https://console.groq.com/settings/limits')}>Groq limits</span>.
+                    <div class="limits-group">
+                        <div class="limits-group-title">Groq</div>
+                        <div class="model-status">Latest limit snapshot returned with each request. The values can change after the time shown.</div>
+                        ${groqObservations.length === 0
+                            ? html`<div class="model-status">No Groq response observed in this app session yet.</div>`
+                            : groqObservations.map(
+                                  observation => html`
+                                      <div class="limits-card">
+                                          <div class="limits-card-header">
+                                              <strong>${observation.model}</strong>
+                                              <span class="limits-card-meta">${observation.kind} · HTTP ${observation.status ?? '—'} · ${new Date(observation.observedAt).toLocaleTimeString()}</span>
+                                          </div>
+                                          <div class="limits-metrics">
+                                              ${this._renderGroqMetric('Requests per day', observation.requestsPerDay, observation.observedAt)}
+                                              ${this._renderGroqMetric('Tokens per minute', observation.tokensPerMinute, observation.observedAt)}
+                                          </div>
+                                          ${Number.isFinite(observation.retryAfterMs)
+                                              ? html`<div class="limits-card-note">Retry was requested until ${new Date(observation.observedAt + observation.retryAfterMs).toLocaleTimeString()}.</div>`
+                                              : ''}
+                                      </div>
+                                  `
+                              )}
+                        <div class="model-status">See <span class="link" @click=${() => this.onExternalLink('https://console.groq.com/settings/limits')}>Groq limits</span> for account-wide details.</div>
                     </div>
                 </div>
             </details>

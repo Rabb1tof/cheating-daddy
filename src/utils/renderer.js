@@ -115,6 +115,17 @@ async function listModels(provider) {
     return ipcRenderer.invoke('models:list', provider);
 }
 
+async function getProviderLimits() {
+    return ipcRenderer.invoke('provider-limits:get');
+}
+
+function onProviderLimitsUpdated(callback) {
+    if (typeof callback !== 'function') throw new TypeError('callback must be a function');
+    const listener = (_event, state) => callback(state);
+    ipcRenderer.on('provider-limits:updated', listener);
+    return () => ipcRenderer.removeListener('provider-limits:updated', listener);
+}
+
 // Cache for preferences to avoid async calls in hot paths
 let preferencesCache = null;
 
@@ -151,7 +162,6 @@ async function initializeGemini(profile = 'interview', language = 'en-US') {
     if (!apiKey) return false;
     const prefs = await storage.getPreferences();
     const success = await ipcRenderer.invoke('initialize-gemini', apiKey, prefs.customPrompt || '', profile, language);
-    if (success) cheatingDaddy.setStatus('Live');
     return success;
 }
 
@@ -1142,6 +1152,8 @@ const cheatingDaddy = {
     // Storage API
     storage,
     listModels,
+    getProviderLimits,
+    onProviderLimitsUpdated,
 
     // Theme API
     theme,

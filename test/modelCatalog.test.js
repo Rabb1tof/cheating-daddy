@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { listModels } = require('../src/utils/modelCatalog');
+const { listModels, groupGeminiModels } = require('../src/utils/modelCatalog');
 
 test('Gemini catalog follows pagination and separates Live from generateContent models', async () => {
     const calls = [];
@@ -28,6 +28,28 @@ test('Gemini catalog follows pagination and separates Live from generateContent 
     assert.match(calls[1].url, /pageToken=next/);
     assert.equal(calls[0].key, 'test-key');
     assert.doesNotMatch(calls[0].url, /test-key/);
+});
+
+test('Gemini Live suggestions include native audio without transcription, translation, or TTS models', () => {
+    const models = [
+        { name: 'models/gemini-2.5-flash-native-audio-preview-12-2025' },
+        { name: 'models/gemini-live-example' },
+        { name: 'models/gemini-live-transcription-example' },
+        { name: 'models/gemini-native-audio-translation-example' },
+        { name: 'models/gemini-native-audio-preview-tts' },
+        { name: 'models/gemini-native-audio-speech-to-text' },
+        { name: 'models/gemini-3.8-flash', supportedGenerationMethods: ['generateContent'] },
+    ];
+
+    const result = groupGeminiModels(models);
+    assert.deepEqual(
+        result.live.map(model => model.id),
+        ['gemini-2.5-flash-native-audio-preview-12-2025', 'gemini-live-example']
+    );
+    assert.deepEqual(
+        result.image.map(model => model.id),
+        ['gemini-3.8-flash']
+    );
 });
 
 test('Groq catalog excludes inactive and non-chat models from response suggestions', async () => {

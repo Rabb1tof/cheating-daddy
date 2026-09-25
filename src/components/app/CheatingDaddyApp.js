@@ -370,6 +370,7 @@ export class CheatingDaddyApp extends LitElement {
     static properties = {
         currentView: { type: String },
         statusText: { type: String },
+        startError: { type: String },
         startTime: { type: Number },
         isRecording: { type: Boolean },
         sessionActive: { type: Boolean },
@@ -394,6 +395,7 @@ export class CheatingDaddyApp extends LitElement {
         super();
         this.currentView = 'main';
         this.statusText = '';
+        this.startError = '';
         this.startTime = null;
         this.isRecording = false;
         this.sessionActive = false;
@@ -529,8 +531,14 @@ export class CheatingDaddyApp extends LitElement {
     // ── Status & Responses ──
 
     setStatus(text) {
-        this.statusText = text;
-        if (text.includes('Ready') || text.includes('Listening') || text.includes('Error')) {
+        this.statusText = String(text || '');
+        if (
+            this.currentView === 'main' &&
+            /^(?:Gemini Live (?:connection failed|stopped|error)|Groq initialization (?:failed|error)|Capture error|Error:)/i.test(this.statusText)
+        ) {
+            this.startError = this.statusText;
+        }
+        if (this.statusText.includes('Ready') || this.statusText.includes('Listening') || this.statusText.includes('Error')) {
             this._currentResponseIsComplete = true;
         }
     }
@@ -570,6 +578,7 @@ export class CheatingDaddyApp extends LitElement {
             }
             this.sessionActive = false;
             this._stopTimer();
+            this.startError = '';
             this.currentView = 'main';
         } else {
             if (window.require) {
@@ -596,6 +605,7 @@ export class CheatingDaddyApp extends LitElement {
     // ── Session start ──
 
     async handleStart() {
+        this.startError = '';
         const prefs = await cheatingDaddy.storage.getPreferences();
         const providerMode = prefs.providerMode === 'cloud' ? 'byok' : prefs.providerMode || 'byok';
 
@@ -641,7 +651,14 @@ export class CheatingDaddyApp extends LitElement {
             const success = useGroqSpeech
                 ? await cheatingDaddy.initializeGroq(this.selectedProfile, this.selectedLanguage)
                 : await cheatingDaddy.initializeGemini(this.selectedProfile, this.selectedLanguage);
-            if (!success) return;
+            if (!success) {
+                if (!this.startError) {
+                    this.startError = useGroqSpeech
+                        ? 'Could not start Groq speech. Check the API key and selected model.'
+                        : 'Could not start Gemini Live. Check the API key and selected Live model.';
+                }
+                return;
+            }
         }
 
         try {
@@ -762,6 +779,7 @@ export class CheatingDaddyApp extends LitElement {
                 return html`
                     <main-view
                         .selectedProfile=${this.selectedProfile}
+                        .startError=${this.startError}
                         .onProfileChange=${p => this.handleProfileChange(p)}
                         .onStart=${() => this.handleStart()}
                         .onExternalLink=${url => this.handleExternalLinkClick(url)}

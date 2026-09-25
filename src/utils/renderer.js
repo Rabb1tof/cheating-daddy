@@ -6,6 +6,8 @@ let screenshotInterval = null;
 let audioContext = null;
 let audioProcessor = null;
 let micAudioProcessor = null;
+let micAudioContext = null;
+let micMediaStream = null;
 let audioBuffer = [];
 const SAMPLE_RATE = 24000;
 const AUDIO_CHUNK_DURATION = 0.1; // seconds
@@ -109,6 +111,10 @@ const storage = {
     },
 };
 
+async function listModels(provider) {
+    return ipcRenderer.invoke('models:list', provider);
+}
+
 // Cache for preferences to avoid async calls in hot paths
 let preferencesCache = null;
 
@@ -142,24 +148,29 @@ function arrayBufferToBase64(buffer) {
 
 async function initializeGemini(profile = 'interview', language = 'en-US') {
     const apiKey = await storage.getApiKey();
-    if (apiKey) {
-        const prefs = await storage.getPreferences();
-        const success = await ipcRenderer.invoke('initialize-gemini', apiKey, prefs.customPrompt || '', profile, language);
-        if (success) {
-            cheatingDaddy.setStatus('Live');
-        } else {
-            cheatingDaddy.setStatus('error');
-        }
-    }
+    if (!apiKey) return false;
+    const prefs = await storage.getPreferences();
+    const success = await ipcRenderer.invoke('initialize-gemini', apiKey, prefs.customPrompt || '', profile, language);
+    if (success) cheatingDaddy.setStatus('Live');
+    return success;
 }
 
-async function initializeLocal(profile = 'interview') {
+async function initializeGroq(profile = 'interview', language = 'en-US') {
+    const apiKey = await storage.getGroqApiKey();
+    if (!apiKey) return false;
+    const prefs = await storage.getPreferences();
+    const result = await ipcRenderer.invoke('initialize-groq', profile, prefs.customPrompt || '', language);
+    cheatingDaddy.setStatus(result.success ? result.warning || 'Groq Live' : result.error || 'Groq initialization failed');
+    return result.success;
+}
+
+async function initializeLocal(profile = 'interview', language = 'en-US') {
     const prefs = await storage.getPreferences();
     const localLlmModel = prefs.localLlmModel || 'unsloth/Qwen3.5-4B-GGUF:Q4_K_M';
     const whisperModel = prefs.whisperModel || 'tiny.en';
     const customPrompt = prefs.customPrompt || '';
 
-    const success = await ipcRenderer.invoke('initialize-local', localLlmModel, whisperModel, profile, customPrompt);
+    const success = await ipcRenderer.invoke('initialize-local', localLlmModel, whisperModel, profile, customPrompt, language);
     if (success) {
         cheatingDaddy.setStatus('Local AI Live');
         return true;
@@ -208,13 +219,12 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
 
     try {
         if (isMacOS) {
-            // On macOS, use SystemAudioDump for audio and getDisplayMedia for screen
-            console.log('Starting macOS capture with SystemAudioDump...');
-
-            // Start macOS audio capture
-            const audioResult = await ipcRenderer.invoke('start-macos-audio');
-            if (!audioResult.success) {
-                throw new Error('Failed to start macOS audio capture: ' + audioResult.error);
+            // SystemAudioDump is only needed when system audio is selected.
+            if (audioMode !== 'mic_only') {
+                const audioResult = await ipcRenderer.invoke('start-macos-audio');
+                if (!audioResult.success) {
+                    throw new Error('Failed to start macOS audio capture: ' + audioResult.error);
+                }
             }
 
             // Get screen capture for screenshots
@@ -246,43 +256,48 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
                     setupLinuxMicProcessing(micStream);
                 } catch (micError) {
                     console.warn('Failed to get microphone access on macOS:', micError);
+                    if (audioMode === 'mic_only') throw micError;
                 }
             }
         } else if (isLinux) {
             // Linux - use display media for screen capture and try to get system audio
-            try {
-                // First try to get system audio via getDisplayMedia (works on newer browsers)
-                mediaStream = await navigator.mediaDevices.getDisplayMedia({
-                    video: {
-                        frameRate: 1,
-                        width: { ideal: 1920 },
-                        height: { ideal: 1080 },
-                    },
-                    audio: {
-                        sampleRate: SAMPLE_RATE,
-                        channelCount: 1,
-                        echoCancellation: false, // Don't cancel system audio
-                        noiseSuppression: false,
-                        autoGainControl: false,
-                    },
-                });
+            if (audioMode === 'mic_only') {
+                mediaStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+            } else {
+                try {
+                    // First try to get system audio via getDisplayMedia (works on newer browsers)
+                    mediaStream = await navigator.mediaDevices.getDisplayMedia({
+                        video: {
+                            frameRate: 1,
+                            width: { ideal: 1920 },
+                            height: { ideal: 1080 },
+                        },
+                        audio: {
+                            sampleRate: SAMPLE_RATE,
+                            channelCount: 1,
+                            echoCancellation: false, // Don't cancel system audio
+                            noiseSuppression: false,
+                            autoGainControl: false,
+                        },
+                    });
 
-                console.log('Linux system audio capture via getDisplayMedia succeeded');
+                    console.log('Linux system audio capture via getDisplayMedia succeeded');
 
-                // Setup audio processing for Linux system audio
-                setupLinuxSystemAudioProcessing();
-            } catch (systemAudioError) {
-                console.warn('System audio via getDisplayMedia failed, trying screen-only capture:', systemAudioError);
+                    // Setup audio processing for Linux system audio
+                    if (mediaStream.getAudioTracks().length > 0) setupLinuxSystemAudioProcessing();
+                } catch (systemAudioError) {
+                    console.warn('System audio via getDisplayMedia failed, trying screen-only capture:', systemAudioError);
 
-                // Fallback to screen-only capture
-                mediaStream = await navigator.mediaDevices.getDisplayMedia({
-                    video: {
-                        frameRate: 1,
-                        width: { ideal: 1920 },
-                        height: { ideal: 1080 },
-                    },
-                    audio: false,
-                });
+                    // Fallback to screen-only capture
+                    mediaStream = await navigator.mediaDevices.getDisplayMedia({
+                        video: {
+                            frameRate: 1,
+                            width: { ideal: 1920 },
+                            height: { ideal: 1080 },
+                        },
+                        audio: false,
+                    });
+                }
             }
 
             // Additionally get microphone input for Linux based on audio mode
@@ -306,8 +321,12 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
                     setupLinuxMicProcessing(micStream);
                 } catch (micError) {
                     console.warn('Failed to get microphone access on Linux:', micError);
-                    // Continue without microphone if permission denied
+                    if (audioMode === 'mic_only') throw micError;
                 }
+            }
+
+            if (audioMode === 'speaker_only' && mediaStream.getAudioTracks().length === 0) {
+                throw new Error('No system audio track was shared; choose microphone input or share system audio');
             }
 
             console.log('Linux capture started - system audio:', mediaStream.getAudioTracks().length > 0, 'microphone mode:', audioMode);
@@ -319,19 +338,26 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
                     width: { ideal: 1920 },
                     height: { ideal: 1080 },
                 },
-                audio: {
-                    sampleRate: SAMPLE_RATE,
-                    channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                },
+                audio:
+                    audioMode === 'mic_only'
+                        ? false
+                        : {
+                              sampleRate: SAMPLE_RATE,
+                              channelCount: 1,
+                              echoCancellation: true,
+                              noiseSuppression: true,
+                              autoGainControl: true,
+                          },
             });
 
-            console.log('Windows capture started with loopback audio');
+            console.log('Windows screen capture started; audio mode:', audioMode);
 
-            // Setup audio processing for Windows loopback audio only
-            setupWindowsLoopbackProcessing();
+            // A mic-only share may have no loopback track at all.
+            if (audioMode !== 'mic_only' && mediaStream.getAudioTracks().length > 0) {
+                setupWindowsLoopbackProcessing();
+            } else if (audioMode === 'speaker_only') {
+                throw new Error('No system audio track was shared; choose microphone input or share system audio');
+            }
 
             if (audioMode === 'mic_only' || audioMode === 'both') {
                 let micStream = null;
@@ -350,8 +376,13 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
                     setupLinuxMicProcessing(micStream);
                 } catch (micError) {
                     console.warn('Failed to get microphone access on Windows:', micError);
+                    if (audioMode === 'mic_only') throw micError;
                 }
             }
+        }
+
+        if (audioMode === 'both' && (!micAudioProcessor || (!isMacOS && !audioProcessor))) {
+            throw new Error('Both audio sources were selected, but system audio or microphone input is unavailable');
         }
 
         console.log('MediaStream obtained:', {
@@ -364,13 +395,16 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
         console.log('Manual mode enabled - screenshots will be captured on demand only');
     } catch (err) {
         console.error('Error starting capture:', err);
+        stopCapture();
         cheatingDaddy.setStatus('error');
+        throw err;
     }
 }
 
 function setupLinuxMicProcessing(micStream) {
     // Setup microphone audio processing for Linux
-    const micAudioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+    micMediaStream = micStream;
+    micAudioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
     const micSource = micAudioContext.createMediaStreamSource(micStream);
     const micProcessor = micAudioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
 
@@ -675,10 +709,20 @@ function stopCapture() {
         audioProcessor = null;
     }
 
-    // Clean up microphone audio processor (Linux only)
+    // Clean up the separate microphone stream and audio context.
     if (micAudioProcessor) {
         micAudioProcessor.disconnect();
         micAudioProcessor = null;
+    }
+
+    if (micAudioContext) {
+        micAudioContext.close();
+        micAudioContext = null;
+    }
+
+    if (micMediaStream) {
+        micMediaStream.getTracks().forEach(track => track.stop());
+        micMediaStream = null;
     }
 
     if (audioContext) {
@@ -1086,6 +1130,7 @@ const cheatingDaddy = {
 
     // Core functionality
     initializeGemini,
+    initializeGroq,
     initializeCloud,
     initializeLocal,
     cancelLocalInitialization,
@@ -1096,6 +1141,7 @@ const cheatingDaddy = {
 
     // Storage API
     storage,
+    listModels,
 
     // Theme API
     theme,

@@ -20,6 +20,7 @@ let whisperProcess = null;
 let whisperBaseUrl = null;
 let localConversationHistory = [];
 let currentSystemPrompt = null;
+let currentWhisperLanguage = 'en';
 let isLocalActive = false;
 let initializationController = null;
 let llamaCacheSnapshot = new Set();
@@ -140,7 +141,7 @@ async function transcribeAudio(pcm16kBuffer) {
     formData.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), 'speech.wav');
     formData.append('response_format', 'json');
     formData.append('temperature', '0.0');
-    formData.append('language', 'en');
+    formData.append('language', currentWhisperLanguage);
 
     const response = await fetch(`${whisperBaseUrl}/inference`, {
         method: 'POST',
@@ -422,18 +423,24 @@ async function startLlamaServer(executablePath, modelPath, projectorPath) {
     await waitForServer(`${llamaBaseUrl}/health`, llamaProcess, 30 * 60 * 1000);
 }
 
-async function initializeLocalSession(model, whisperModel, profile, customPrompt) {
+async function initializeLocalSession(model, whisperModel, profile, customPrompt, language = 'en-US') {
     console.log('[LocalAI] Initializing native local session:', { model, whisperModel, profile });
     sendToRenderer('session-initializing', true);
 
     try {
         closeLocalSession();
+        const selectedLanguage = typeof language === 'string' && /^[a-z]{2,3}-[A-Z]{2}$/.test(language) ? language : 'en-US';
+        currentWhisperLanguage = selectedLanguage.startsWith('cmn-') ? 'zh' : selectedLanguage.split('-')[0];
+        const effectiveWhisperModel =
+            currentWhisperLanguage !== 'en' && typeof whisperModel === 'string' && whisperModel.endsWith('.en')
+                ? whisperModel.slice(0, -3)
+                : whisperModel;
         initializationController = new AbortController();
         llamaCacheSnapshot = getDirectoryEntries(path.join(getModelsDirectory(), 'llama'));
-        currentSystemPrompt = getSystemPrompt(profile, customPrompt, false);
+        currentSystemPrompt = getSystemPrompt(profile, customPrompt, false, selectedLanguage);
         llamaModel = model;
 
-        const nativeFiles = await prepareNativeFiles(model, whisperModel, initializationController.signal);
+        const nativeFiles = await prepareNativeFiles(model, effectiveWhisperModel, initializationController.signal);
         validatePreparedNativeFiles(nativeFiles);
 
         sendToRenderer('update-status', 'Starting Whisper...');
@@ -504,6 +511,7 @@ function closeLocalSession() {
     resampleRemainder = Buffer.alloc(0);
     localConversationHistory = [];
     currentSystemPrompt = null;
+    currentWhisperLanguage = 'en';
 }
 
 async function cancelLocalInitialization() {

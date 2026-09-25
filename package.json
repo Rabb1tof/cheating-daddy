@@ -9,6 +9,7 @@
         "package": "electron-forge package",
         "make": "electron-forge make",
         "publish": "electron-forge publish",
+        "test": "node --test",
         "lint": "echo \"No linting configured\""
     },
     "keywords": [
@@ -24,9 +25,9 @@
     },
     "license": "GPL-3.0",
     "dependencies": {
-        "@google/genai": "^1.2.0",
+        "@google/genai": "2.24.0",
         "electron-squirrel-startup": "^1.0.1",
-        "ws": "^8.19.0"
+        "ws": "8.21.3"
     },
     "devDependencies": {
         "@electron-forge/cli": "^7.8.1",

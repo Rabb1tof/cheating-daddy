@@ -47,6 +47,11 @@ const BINARY_RELEASES = {
 };
 
 const WHISPER_MODELS = {
+    tiny: {
+        filename: 'ggml-tiny.bin',
+        url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin',
+        sha256: 'be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21',
+    },
     'tiny.en': {
         filename: 'ggml-tiny.en.bin',
         url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin',
@@ -57,10 +62,20 @@ const WHISPER_MODELS = {
         url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin',
         sha256: 'a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002',
     },
+    base: {
+        filename: 'ggml-base.bin',
+        url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin',
+        sha256: '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe',
+    },
     'small.en': {
         filename: 'ggml-small.en.bin',
         url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin',
         sha256: 'c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d',
+    },
+    small: {
+        filename: 'ggml-small.bin',
+        url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin',
+        sha256: '1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b',
     },
 };
 

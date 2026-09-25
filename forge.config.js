@@ -11,6 +11,7 @@ module.exports = {
             identity: '-',
             identityValidation: false,
             continueOnError: false,
+            optionsForFile: () => ({ timestamp: 'none' }),
         },
         extendInfo: {
             NSMicrophoneUsageDescription: 'Cheating Daddy captures microphone audio only while an assistant session is active.',

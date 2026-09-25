@@ -162,7 +162,6 @@ async function initializeGemini(profile = 'interview', language = 'en-US') {
     if (!apiKey) return false;
     const prefs = await storage.getPreferences();
     const success = await ipcRenderer.invoke('initialize-gemini', apiKey, prefs.customPrompt || '', profile, language);
-    if (success) cheatingDaddy.setStatus('Live');
     return success;
 }
 

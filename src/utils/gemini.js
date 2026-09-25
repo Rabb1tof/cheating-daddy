@@ -36,6 +36,7 @@ let currentCustomPrompt = null;
 let currentResponseLanguage = 'en-US';
 let isInitializingSession = false;
 let currentSystemPrompt = null;
+const closedGeminiSessions = new WeakSet();
 
 function formatSpeakerResults(results) {
     let text = '';
@@ -74,6 +75,7 @@ let geminiReconnectBlockedReason = null;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY = 2000;
 const GEMINI_LIVE_SETUP_TIMEOUT_MS = 15000;
+const GEMINI_LIVE_STABILIZATION_MS = 200;
 
 function isNonRetryableGeminiError(error) {
     const detail = [error?.message, error?.reason, error?.code, error?.status].filter(Boolean).join(' ').toLowerCase();
@@ -581,6 +583,10 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         geminiReconnectBlockedReason = null;
     }
 
+    let startupComplete = false;
+    let startupFailure = null;
+    let connectedSession = null;
+    let closeTransport = () => {};
     try {
         // Open the transport log before setup so failures before connect are recorded too.
         if (!isReconnect) initializeNewSession(profile, customPrompt);
@@ -590,7 +596,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
             apiKey: apiKey,
             httpOptions: { apiVersion: 'v1beta' },
         });
-        const closeTransport = trackLiveTransport(client);
+        closeTransport = trackLiveTransport(client);
 
         // Get enabled tools first to determine Google Search status
         const enabledTools = await getEnabledTools();
@@ -654,22 +660,36 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                             const reason = safeGeminiErrorText(e, apiKey);
                             console.log('Session error:', reason);
                             if (guard.isAbandoned()) return;
+                            const setupError = new Error(reason);
+                            setupError.code = e?.code;
+                            if (!startupComplete) startupFailure ||= setupError;
                             if (isNonRetryableGeminiError(e)) geminiReconnectBlockedReason = reason;
                             logTransportEvent('gemini.live.error', {
                                 status: geminiErrorStatus(e),
                                 error: reason,
                             });
                             sendToRenderer('update-status', 'Gemini Live error: ' + reason);
-                            if (guard.isWaiting()) {
-                                const setupError = new Error(reason);
-                                setupError.code = e?.code;
-                                guard.fail(setupError);
-                            }
+                            if (!startupComplete) guard.fail(setupError);
                         },
                         onclose: function (e) {
                             const closeReason = safeGeminiErrorText(e, apiKey);
                             console.log('Session closed:', closeReason);
                             if (guard.isAbandoned()) return;
+                            if (
+                                startupComplete &&
+                                connectedSession &&
+                                global.geminiSessionRef?.current &&
+                                global.geminiSessionRef.current !== connectedSession
+                            ) {
+                                return;
+                            }
+                            const setupError = new Error(closeReason);
+                            setupError.code = e?.code;
+                            if (!startupComplete) startupFailure ||= setupError;
+                            if (connectedSession) {
+                                closedGeminiSessions.add(connectedSession);
+                                if (global.geminiSessionRef?.current === connectedSession) global.geminiSessionRef.current = null;
+                            }
                             logTransportEvent('gemini.live.closed', {
                                 status: geminiErrorStatus(e),
                                 reason: closeReason,
@@ -680,13 +700,11 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                                 isUserClosing = false;
                                 closeTransportLog();
                                 sendToRenderer('update-status', 'Session closed');
-                                if (guard.isWaiting()) guard.fail(new Error('Session closed'));
+                                if (!startupComplete) guard.fail(new Error('Session closed'));
                                 return;
                             }
 
-                            if (guard.isWaiting()) {
-                                const setupError = new Error(closeReason);
-                                setupError.code = e?.code;
+                            if (!startupComplete) {
                                 guard.fail(setupError);
                                 return;
                             }
@@ -723,6 +741,15 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
             GEMINI_LIVE_SETUP_TIMEOUT_MS
         );
 
+        connectedSession = session;
+        // A model can acknowledge setup and then immediately close the socket.
+        // Let the next transport event arrive before Start is reported as ready.
+        if (!startupFailure) await new Promise(resolve => setTimeout(resolve, GEMINI_LIVE_STABILIZATION_MS));
+        if (startupFailure || closedGeminiSessions.has(session)) {
+            throw startupFailure || new Error('Gemini Live closed during setup');
+        }
+        startupComplete = true;
+
         isInitializingSession = false;
         if (!isReconnect) {
             sendToRenderer('session-initializing', false);
@@ -730,6 +757,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         sendToRenderer('update-status', 'Live session connected');
         return session;
     } catch (error) {
+        closeTransport();
         const reason = safeGeminiErrorText(error, apiKey);
         console.error('Failed to initialize Gemini session:', reason);
         logTransportEvent('gemini.live.connect.failed', { status: geminiErrorStatus(error), reason });
@@ -776,7 +804,7 @@ async function attemptReconnect() {
             return false;
         }
 
-        if (session && global.geminiSessionRef) {
+        if (session && !closedGeminiSessions.has(session) && global.geminiSessionRef) {
             global.geminiSessionRef.current = session;
 
             // Restore context from conversation history via text message
@@ -1057,7 +1085,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         groqTranscriptionSession = null;
         groqTextModelOverride = null;
         const session = await initializeGeminiSession(apiKey, customPrompt, profile, language);
-        if (session) {
+        if (session && !closedGeminiSessions.has(session)) {
             geminiSessionRef.current = session;
             return true;
         }

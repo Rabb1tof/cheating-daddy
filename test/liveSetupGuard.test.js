@@ -41,6 +41,28 @@ test('Gemini Live setup guard rejects an early close instead of waiting forever'
     assert.equal(transportClosed, 1);
 });
 
+test('Gemini Live setup guard rejects a close immediately after connect resolves', async () => {
+    let transportClosed = 0;
+    let sessionClosed = 0;
+    await assert.rejects(
+        connectWithSetupGuard(
+            guard =>
+                new Promise(resolve => {
+                    queueMicrotask(() => {
+                        resolve({ close: () => sessionClosed++ });
+                        queueMicrotask(() => guard.fail(new Error('Live model rejected after setup')));
+                    });
+                }),
+            () => transportClosed++,
+            100
+        ),
+        /Live model rejected after setup/
+    );
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(transportClosed, 1);
+    assert.equal(sessionClosed, 1);
+});
+
 test('Gemini Live setup guard times out, closes the transport, and closes a late session', async () => {
     let finishConnect;
     let transportClosed = 0;

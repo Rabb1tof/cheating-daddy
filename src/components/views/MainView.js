@@ -1163,6 +1163,9 @@ export class MainView extends LitElement {
                                       ${Number.isFinite(observation.requestsPerDay?.reset)
                                           ? html`Daily reset was ${this._formatLimitDuration(observation.requestsPerDay.reset)} after that response.`
                                           : ''}
+                                      ${Number.isFinite(observation.tokensPerMinute?.reset)
+                                          ? html`Token reset was ${this._formatLimitDuration(observation.tokensPerMinute.reset)} after that response.`
+                                          : ''}
                                       ${Number.isFinite(observation.retryAfterMs)
                                           ? html`Retry after ${this._formatLimitDuration(observation.retryAfterMs)} from that response.`
                                           : ''}

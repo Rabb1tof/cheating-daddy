@@ -23,6 +23,7 @@ function trackLiveTransport(client) {
 async function connectWithSetupGuard(connect, closeTransport, timeoutMs) {
     let phase = 'waiting';
     let rejectEarly;
+    let earlyError = null;
     let timeout;
     let connectPromise;
     const earlyFailure = new Promise((_, reject) => {
@@ -32,7 +33,10 @@ async function connectWithSetupGuard(connect, closeTransport, timeoutMs) {
         isWaiting: () => phase === 'waiting',
         isAbandoned: () => phase === 'abandoned',
         fail: error => {
-            if (phase === 'waiting') rejectEarly(error);
+            if (phase === 'waiting' && !earlyError) {
+                earlyError = error;
+                rejectEarly(error);
+            }
         },
     };
 
@@ -42,6 +46,8 @@ async function connectWithSetupGuard(connect, closeTransport, timeoutMs) {
             timeout = setTimeout(() => reject(new Error('Timed out waiting for Gemini Live setup')), timeoutMs);
         });
         const session = await Promise.race([connectPromise, earlyFailure, timedOut]);
+        // A close can arrive after connect() settles but before this continuation.
+        if (earlyError) throw earlyError;
         phase = 'connected';
         return session;
     } catch (error) {

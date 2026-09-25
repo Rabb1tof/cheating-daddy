@@ -1,5 +1,19 @@
 import { html, css, LitElement } from '../../assets/lit-core-2.7.4.min.js';
 
+function escapeResponseHtml(value) {
+    const entities = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    return String(value ?? '').replace(/[&<>"']/g, character => entities[character]);
+}
+
+function safeResponseUrl(value) {
+    try {
+        const url = new URL(value);
+        return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null;
+    } catch {
+        return null;
+    }
+}
+
 export class AssistantView extends LitElement {
     static styles = css`
         :host {
@@ -22,7 +36,6 @@ export class AssistantView extends LitElement {
             line-height: var(--line-height);
             background: var(--bg-app);
             padding: var(--space-sm) var(--space-md);
-            scroll-behavior: smooth;
             user-select: text;
             cursor: text;
             color: var(--text-primary);
@@ -317,6 +330,7 @@ export class AssistantView extends LitElement {
         this.onSendText = () => {};
         this.isAnalyzing = false;
         this._animFrame = null;
+        this._lastRenderedResponseIndex = -1;
     }
 
     getProfileNames() {
@@ -340,25 +354,38 @@ export class AssistantView extends LitElement {
     renderMarkdown(content) {
         if (typeof window !== 'undefined' && window.marked) {
             try {
-                window.marked.setOptions({
+                const renderer = new window.marked.Renderer();
+                // A model-supplied image URL must not trigger a network request
+                // while the HTML is parsed or displayed. Keep its alt text.
+                renderer.image = (_href, _title, alt) => alt;
+                const rendered = window.marked.parse(String(content ?? ''), {
                     breaks: true,
                     gfm: true,
-                    sanitize: false,
+                    // This bundled Marked version escapes raw HTML and rejects
+                    // scriptable Markdown URLs when sanitize is enabled.
+                    sanitize: true,
+                    silent: true,
+                    renderer,
                 });
-                let rendered = window.marked.parse(content);
-                rendered = this.wrapWordsInSpans(rendered);
-                return rendered;
+                return this.wrapWordsInSpans(rendered);
             } catch (error) {
                 console.warn('Error parsing markdown:', error);
-                return content;
             }
         }
-        return content;
+        return escapeResponseHtml(content);
     }
 
     wrapWordsInSpans(html) {
         const parser = new DOMParser();
         const doc = parser.parseFromString(html, 'text/html');
+        for (const link of doc.body.querySelectorAll('a')) {
+            const href = safeResponseUrl(link.getAttribute('href'));
+            for (const attribute of Array.from(link.attributes)) link.removeAttribute(attribute.name);
+            if (href) link.setAttribute('href', href);
+        }
+        for (const image of doc.body.querySelectorAll('img')) {
+            image.replaceWith(document.createTextNode(image.getAttribute('alt') || ''));
+        }
         const tagsToSkip = ['PRE'];
 
         function wrap(node) {
@@ -628,6 +655,15 @@ export class AssistantView extends LitElement {
 
     firstUpdated() {
         super.firstUpdated();
+        this.shadowRoot.querySelector('#responseContainer')?.addEventListener('click', event => {
+            const link = event.target.closest?.('a[href]');
+            if (!link) return;
+            event.preventDefault();
+            const href = safeResponseUrl(link.getAttribute('href'));
+            if (href && window.require) {
+                window.require('electron').ipcRenderer.invoke('open-external', href).catch(console.error);
+            }
+        });
         this.updateResponseContent();
     }
 
@@ -655,9 +691,20 @@ export class AssistantView extends LitElement {
     updateResponseContent() {
         const container = this.shadowRoot.querySelector('#responseContainer');
         if (container) {
+            const responseChanged = this._lastRenderedResponseIndex !== this.currentResponseIndex;
+            const wasNearBottom = container.scrollHeight - container.clientHeight - container.scrollTop <= 48;
+            const previousScrollTop = container.scrollTop;
             const currentResponse = this.getCurrentResponse();
             const renderedResponse = this.renderMarkdown(currentResponse);
             container.innerHTML = renderedResponse;
+            if (responseChanged) {
+                container.scrollTop = 0;
+            } else if (wasNearBottom) {
+                container.scrollTop = container.scrollHeight;
+            } else {
+                container.scrollTop = previousScrollTop;
+            }
+            this._lastRenderedResponseIndex = this.currentResponseIndex;
             if (this.shouldAnimateResponse) {
                 this.dispatchEvent(new CustomEvent('response-animation-complete', { bubbles: true, composed: true }));
             }

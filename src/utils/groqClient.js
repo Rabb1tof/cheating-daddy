@@ -238,6 +238,7 @@ function createGroqClient({ now = Date.now, sleep = waitWithSignal, setTimer = s
         fallbackModel,
         messages,
         kind = 'text',
+        maxCompletionTokens,
         disableThinking = false,
         onProgress,
         onRateLimits,
@@ -249,13 +250,15 @@ function createGroqClient({ now = Date.now, sleep = waitWithSignal, setTimer = s
         if (typeof model !== 'string' || !model.trim()) throw new TypeError('Groq model is required');
         if (!Array.isArray(messages) || messages.length === 0) throw new TypeError('Groq messages must be a non-empty array');
         if (kind !== 'text' && kind !== 'image') throw new TypeError('Groq kind must be text or image');
+        if (maxCompletionTokens !== undefined && (kind !== 'text' || !Number.isSafeInteger(maxCompletionTokens) || maxCompletionTokens < 1))
+            throw new TypeError('maxCompletionTokens must be a positive integer for text requests');
         if (onProgress !== undefined && typeof onProgress !== 'function') throw new TypeError('onProgress must be a function');
         if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
         if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new TypeError('timeoutMs must be a positive number');
         if (signal && (typeof signal.addEventListener !== 'function' || typeof signal.aborted !== 'boolean'))
             throw new TypeError('signal must be an AbortSignal');
 
-        const completionTokens = kind === 'image' ? IMAGE_COMPLETION_TOKENS : TEXT_COMPLETION_TOKENS;
+        const completionTokens = kind === 'image' ? IMAGE_COMPLETION_TOKENS : maxCompletionTokens ?? TEXT_COMPLETION_TOKENS;
         const tokens = estimateRequestTokens(messages, completionTokens);
         if (tokens > TOKEN_BUDGET) {
             throw new GroqApiError(

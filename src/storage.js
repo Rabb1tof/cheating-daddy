@@ -10,6 +10,7 @@ const DEFAULT_CONFIG = {
     onboarded: false,
     layout: 'normal',
     transcriptionProvider: 'gemini',
+    responseProvider: 'auto',
     screenshotProvider: 'auto',
     geminiLiveModel: 'gemini-3.8-live',
     geminiImageModel: 'gemini-3.8-flash',
@@ -29,6 +30,9 @@ const DEFAULT_CREDENTIALS = {
 
 const DEFAULT_PREFERENCES = {
     customPrompt: '',
+    responseStyle: 'concise',
+    interruptOnNewRequest: false,
+    rememberRecentAnswers: true,
     providerMode: 'byok',
     selectedProfile: 'interview',
     selectedLanguage: 'en-US',
@@ -174,6 +178,14 @@ function initializeStorage() {
 function getConfig() {
     const saved = readJsonFile(getConfigPath(), {});
     const config = { ...DEFAULT_CONFIG, ...saved };
+    if (fs.existsSync(getConfigPath()) && !Object.prototype.hasOwnProperty.call(saved, 'responseProvider')) {
+        // Before this setting existed, any saved Groq key made Gemini Live use
+        // Groq for answers. Record that choice once so later key changes do not
+        // silently switch the response provider.
+        config.responseProvider = config.transcriptionProvider === 'gemini' && getGroqApiKey().trim() ? 'groq' : 'auto';
+        writeJsonFile(getConfigPath(), config);
+    }
+    if (!['auto', 'gemini', 'groq'].includes(config.responseProvider)) config.responseProvider = 'auto';
     // Replace the former bundled defaults without changing manually selected IDs.
     if (config.geminiLiveModel === 'gemini-3.1-flash-live-preview') config.geminiLiveModel = DEFAULT_CONFIG.geminiLiveModel;
     if (config.groqModel === 'qwen/qwen3.6-27b') config.groqModel = DEFAULT_CONFIG.groqModel;

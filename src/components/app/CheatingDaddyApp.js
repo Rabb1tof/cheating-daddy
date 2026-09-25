@@ -405,6 +405,7 @@ export class CheatingDaddyApp extends LitElement {
         this.selectedImageQuality = 'medium';
         this.layoutMode = 'normal';
         this.responses = [];
+        this._responseIds = [];
         this.currentResponseIndex = -1;
         this._viewInstances = new Map();
         this._isClickThrough = false;
@@ -544,22 +545,54 @@ export class CheatingDaddyApp extends LitElement {
     }
 
     addNewResponse(response) {
-        const wasOnLatest = this.currentResponseIndex === this.responses.length - 1;
-        this.responses = [...this.responses, response];
-        if (wasOnLatest || this.currentResponseIndex === -1) {
-            this.currentResponseIndex = this.responses.length - 1;
+        const payload = this._responsePayload(response);
+        if (!payload) return;
+
+        const existingIndex = payload.id === null ? -1 : this._responseIds.indexOf(payload.id);
+        if (existingIndex >= 0) {
+            this.responses = this.responses.map((text, index) => (index === existingIndex ? payload.text : text));
+        } else {
+            const wasOnLatest = this.currentResponseIndex === this.responses.length - 1;
+            this.responses = [...this.responses, payload.text];
+            this._responseIds = [...this._responseIds, payload.id];
+            if (wasOnLatest || this.currentResponseIndex === -1) {
+                this.currentResponseIndex = this.responses.length - 1;
+            }
         }
         this._awaitingNewResponse = false;
         this.requestUpdate();
     }
 
     updateCurrentResponse(response) {
-        if (this.responses.length > 0) {
-            this.responses = [...this.responses.slice(0, -1), response];
+        const payload = this._responsePayload(response);
+        if (!payload) return;
+
+        if (payload.id !== null) {
+            const index = this._responseIds.indexOf(payload.id);
+            if (index < 0) return;
+            this.responses = this.responses.map((text, responseIndex) => (responseIndex === index ? payload.text : text));
+        } else if (this.responses.length > 0) {
+            this.responses = [...this.responses.slice(0, -1), payload.text];
         } else {
-            this.addNewResponse(response);
+            this.addNewResponse(payload.text);
+            return;
         }
         this.requestUpdate();
+    }
+
+    _responsePayload(response) {
+        if (typeof response === 'string') return { id: null, text: response };
+        if (
+            response &&
+            typeof response === 'object' &&
+            typeof response.id === 'string' &&
+            response.id.length > 0 &&
+            response.id.length <= 128 &&
+            typeof response.text === 'string'
+        ) {
+            return { id: response.id, text: response.text };
+        }
+        return null;
     }
 
     // ── Navigation ──
@@ -671,6 +704,7 @@ export class CheatingDaddyApp extends LitElement {
             return;
         }
         this.responses = [];
+        this._responseIds = [];
         this.currentResponseIndex = -1;
         this.startTime = Date.now();
         this.sessionActive = true;

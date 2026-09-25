@@ -1,13 +1,15 @@
-const { GoogleGenAI, Modality } = require('@google/genai');
+const { GoogleGenAI, Modality, ActivityHandling } = require('@google/genai');
 const { BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const { saveDebugAudio } = require('../audioUtils');
-const { getSystemPrompt, getCompactSystemPrompt } = require('./prompts');
+const { getSystemPrompt, getCompactSystemPrompt, getScreenshotSystemPrompt } = require('./prompts');
 const { getApiKey, getGroqApiKey, incrementCharUsage, getConfig, getPreferences } = require('../storage');
 const { GroqTranscriptionSession } = require('./groqTranscription');
 const { resample24kTo16k } = require('./pcm');
 const { listModels } = require('./modelCatalog');
 const { requestGroqCompletion } = require('./groqClient');
+const { createResponseStream } = require('./responseStream');
+const { buildRecentAnswerContext } = require('./recentAnswers');
 const { getGroqLimitsGeneration, recordGroqLimits, getGeminiUsageGeneration, recordGeminiUsage } = require('./providerLimits');
 const { trackLiveTransport, connectWithSetupGuard } = require('./liveSetupGuard');
 const { connectCloud, sendCloudAudio, sendCloudText, sendCloudImage, closeCloud, isCloudActive, setOnTurnComplete } = require('./cloud');
@@ -34,6 +36,9 @@ let screenAnalysisHistory = [];
 let currentProfile = null;
 let currentCustomPrompt = null;
 let currentResponseLanguage = 'en-US';
+let currentResponseStyle = 'concise';
+let currentInterruptOnNewRequest = false;
+let currentRememberRecentAnswers = true;
 let isInitializingSession = false;
 let currentSystemPrompt = null;
 const closedGeminiSessions = new WeakSet();
@@ -58,13 +63,65 @@ let groqTranscriptionSession = null;
 let groqAudioMode = 'speaker_only';
 let groqTextModelOverride = null;
 let groqRequestController = new AbortController();
+let groqCompletionQueue = Promise.resolve();
+const activeCompletionRequests = new Set();
 let geminiTranscriptionFlushTimer = null;
+let currentGeminiResponseProvider = 'gemini';
+let liveReplyActive = false;
+let pendingLiveTexts = [];
+let currentLiveTypedQuestion = '';
+let liveSpeechRequestNotified = false;
+let pendingLiveScreenMemory = [];
+let liveScreenMemorySending = false;
 
 function cancelGroqRequests() {
     groqRequestController.abort();
     groqRequestController = new AbortController();
+    groqCompletionQueue = Promise.resolve();
     if (geminiTranscriptionFlushTimer) clearTimeout(geminiTranscriptionFlushTimer);
     geminiTranscriptionFlushTimer = null;
+}
+
+function enqueueGroqCompletion(work) {
+    const sessionController = groqRequestController;
+    const run = () => {
+        if (sessionController !== groqRequestController || sessionController.signal.aborted) return { success: false, error: 'Session closed' };
+        return work();
+    };
+    if (currentInterruptOnNewRequest) return Promise.resolve().then(run);
+    const pending = groqCompletionQueue.then(run, run);
+    groqCompletionQueue = pending.catch(() => {});
+    return pending;
+}
+
+function interruptActiveCompletionRequests() {
+    if (!currentInterruptOnNewRequest) return;
+    const reason = new Error('Interrupted by a new request');
+    reason.name = 'AbortError';
+    reason.code = 'new-request';
+    for (const previous of activeCompletionRequests) previous.abort(reason);
+}
+
+function startCompletionRequest() {
+    interruptActiveCompletionRequests();
+    const controller = new AbortController();
+    const sessionSignal = groqRequestController.signal;
+    const onSessionClosed = () => controller.abort(new Error('Session closed'));
+    if (sessionSignal.aborted) onSessionClosed();
+    else sessionSignal.addEventListener('abort', onSessionClosed, { once: true });
+    activeCompletionRequests.add(controller);
+    return {
+        signal: controller.signal,
+        finish() {
+            activeCompletionRequests.delete(controller);
+            sessionSignal.removeEventListener('abort', onSessionClosed);
+        },
+    };
+}
+
+function cancelledCompletionResult(signal, model) {
+    if (signal.reason?.code === 'new-request') return { success: true, interrupted: true, model };
+    return { success: false, error: 'Session closed' };
 }
 
 // Reconnection variables
@@ -106,16 +163,39 @@ function sendToRenderer(channel, data) {
     }
 }
 
-// Build context message for session restoration
+function recentAnswerContext(maxBytes = 1800) {
+    return currentRememberRecentAnswers ? buildRecentAnswerContext(conversationHistory, screenAnalysisHistory, maxBytes) : '';
+}
+
+async function flushLiveScreenMemory() {
+    if (liveReplyActive || liveScreenMemorySending || !pendingLiveScreenMemory.length) return;
+    const session = global.geminiSessionRef?.current;
+    if (!session?.sendClientContent) return;
+    liveScreenMemorySending = true;
+    const batch = pendingLiveScreenMemory.splice(0);
+    const sessionId = currentSessionId;
+    try {
+        const context = buildRecentAnswerContext([], batch, 1200);
+        if (context) {
+            await session.sendClientContent({
+                turns: [{ role: 'user', parts: [{ text: `Previous screenshot results for context only:\n${context}` }] }],
+                turnComplete: false,
+            });
+        }
+    } catch (error) {
+        if (sessionId === currentSessionId && session === global.geminiSessionRef?.current) {
+            pendingLiveScreenMemory = [...batch, ...pendingLiveScreenMemory].slice(-3);
+            console.error('Could not add screenshot context to Gemini Live:', error);
+        }
+    } finally {
+        liveScreenMemorySending = false;
+    }
+}
+
+// Build a bounded context message for session restoration.
 function buildContextMessage() {
-    const lastTurns = conversationHistory.slice(-20);
-    const validTurns = lastTurns.filter(turn => turn.transcription?.trim() && turn.ai_response?.trim());
-
-    if (validTurns.length === 0) return null;
-
-    const contextLines = validTurns.map(turn => `[Interviewer]: ${turn.transcription.trim()}\n[Your answer]: ${turn.ai_response.trim()}`);
-
-    return `Session reconnected. Here's the conversation so far:\n\n${contextLines.join('\n\n')}\n\nContinue from here.`;
+    const context = recentAnswerContext(1800);
+    return context ? `Session reconnected. Use this prior context when relevant.\n\n${context}` : null;
 }
 
 // Conversation management functions
@@ -127,8 +207,16 @@ function initializeNewSession(profile = null, customPrompt = null) {
     conversationHistory = [];
     screenAnalysisHistory = [];
     groqConversationHistory = [];
+    liveReplyActive = false;
+    pendingLiveTexts = [];
+    currentLiveTypedQuestion = '';
+    liveSpeechRequestNotified = false;
+    pendingLiveScreenMemory = [];
     currentProfile = profile;
     currentCustomPrompt = customPrompt;
+    currentResponseStyle = getPreferences().responseStyle === 'detailed' ? 'detailed' : 'concise';
+    currentInterruptOnNewRequest = getPreferences().interruptOnNewRequest === true;
+    currentRememberRecentAnswers = getPreferences().rememberRecentAnswers !== false;
     console.log('New conversation session started:', currentSessionId, 'profile:', profile);
 
     // Save initial session with profile context
@@ -142,9 +230,7 @@ function initializeNewSession(profile = null, customPrompt = null) {
 }
 
 function saveConversationTurn(transcription, aiResponse) {
-    if (!currentSessionId) {
-        initializeNewSession();
-    }
+    if (!currentSessionId) return;
 
     const conversationTurn = {
         timestamp: Date.now(),
@@ -164,9 +250,7 @@ function saveConversationTurn(transcription, aiResponse) {
 }
 
 function saveScreenAnalysis(prompt, response, model) {
-    if (!currentSessionId) {
-        initializeNewSession();
-    }
+    if (!currentSessionId) return;
 
     const analysisEntry = {
         timestamp: Date.now(),
@@ -177,6 +261,12 @@ function saveScreenAnalysis(prompt, response, model) {
 
     screenAnalysisHistory.push(analysisEntry);
     console.log('Saved screen analysis:', analysisEntry);
+
+    if (currentRememberRecentAnswers && currentProviderMode === 'byok' && currentGeminiResponseProvider === 'gemini') {
+        pendingLiveScreenMemory.push(analysisEntry);
+        pendingLiveScreenMemory = pendingLiveScreenMemory.slice(-3);
+        void flushLiveScreenMemory();
+    }
 
     // Send to renderer to save
     sendToRenderer('save-screen-analysis', {
@@ -287,8 +377,8 @@ async function initializeGroqTranscriptionSession(profile = 'interview', customP
     isUserClosing = false;
     groqAudioMode = getPreferences().audioMode || 'speaker_only';
     currentResponseLanguage = language;
-    currentSystemPrompt = getSystemPrompt(profile, customPrompt, false, language);
     initializeNewSession(profile, customPrompt);
+    currentSystemPrompt = getSystemPrompt(profile, customPrompt, false, language, currentResponseStyle);
 
     groqTranscriptionSession = new GroqTranscriptionSession({
         apiKey,
@@ -320,11 +410,11 @@ async function initializeGroqTranscriptionSession(profile = 'interview', customP
 function sendFinalTranscriptionToGroq() {
     const transcription = currentTranscription.trim();
     currentTranscription = '';
-    if (hasGroqKey() && transcription) void sendToGroq(transcription);
+    liveSpeechRequestNotified = false;
+    if (transcription) void sendToGroq(transcription);
 }
 
 function scheduleFinalTranscriptionToGroq() {
-    if (!hasGroqKey()) return;
     if (geminiTranscriptionFlushTimer) clearTimeout(geminiTranscriptionFlushTimer);
     // Gemini may emit final input transcription just after turnComplete.
     geminiTranscriptionFlushTimer = setTimeout(() => {
@@ -359,36 +449,50 @@ function stripThinkingTags(text) {
 }
 
 function groqSystemPrompt() {
-    return getCompactSystemPrompt(currentProfile, currentCustomPrompt, currentResponseLanguage);
+    return getCompactSystemPrompt(currentProfile, currentCustomPrompt, currentResponseLanguage, currentResponseStyle);
+}
+
+function screenshotPromptSettings() {
+    const preferences = getPreferences();
+    const hasSessionContext = currentProfile !== null;
+    return {
+        profile: hasSessionContext ? currentProfile : preferences.selectedProfile || 'interview',
+        context: hasSessionContext ? currentCustomPrompt : preferences.customPrompt || '',
+        language: hasSessionContext ? currentResponseLanguage : preferences.selectedLanguage || 'en-US',
+        style: hasSessionContext ? currentResponseStyle : preferences.responseStyle === 'detailed' ? 'detailed' : 'concise',
+    };
 }
 
 function groqTextMessages(transcription) {
+    const priorAnswers = recentAnswerContext(1500);
     return [
         { role: 'system', content: groqSystemPrompt() },
-        ...groqConversationHistory.slice(-4).map(({ role, content }) => ({ role, content: content.slice(0, 900) })),
-        { role: 'user', content: transcription.slice(0, 1800) },
+        { role: 'user', content: priorAnswers ? `${priorAnswers}\n\nCurrent request: ${transcription.slice(0, 1800)}` : transcription.slice(0, 1800) },
     ];
 }
 
 function displayGroqProgress(signal) {
-    let shown = false;
+    const responseStream = createResponseStream(sendToRenderer);
     return {
         update(text) {
             if (signal.aborted) return;
             const visible = stripThinkingTags(text);
             if (!visible) return;
-            sendToRenderer(shown ? 'update-response' : 'new-response', visible);
-            shown = true;
+            responseStream.update(visible);
         },
         finish(text) {
             const visible = stripThinkingTags(text);
-            if (visible) sendToRenderer(shown ? 'update-response' : 'new-response', visible);
+            if (visible) responseStream.update(visible);
             return visible;
         },
     };
 }
 
-async function sendToGroq(transcription) {
+function sendToGroq(transcription) {
+    return enqueueGroqCompletion(() => sendToGroqNow(transcription));
+}
+
+async function sendToGroqNow(transcription) {
     const apiKey = getGroqApiKey()?.trim();
     const input = typeof transcription === 'string' ? transcription.trim() : '';
     if (!apiKey) return { success: false, error: 'Groq API key is required', status: 401 };
@@ -397,7 +501,10 @@ async function sendToGroq(transcription) {
     const config = getConfig();
     const primaryModel = groqTextModelOverride || config.groqModel?.trim();
     if (!primaryModel) return { success: false, error: 'Choose a Groq text model in settings', status: 400 };
-    const signal = groqRequestController.signal;
+    const request = startCompletionRequest();
+    const signal = request.signal;
+    const sessionId = currentSessionId;
+    const completionTokens = currentResponseStyle === 'detailed' ? 1024 : 512;
     const messages = groqTextMessages(input);
     const display = displayGroqProgress(signal);
     logTransportEvent('groq.text.request', { model: primaryModel, transcription: input });
@@ -410,16 +517,17 @@ async function sendToGroq(transcription) {
             fallbackModel: config.groqFallbackModel?.trim(),
             messages,
             kind: 'text',
+            maxCompletionTokens: completionTokens,
             disableThinking: config.disableGroqThinking === true,
             signal,
             onProgress: text => display.update(text),
             onRateLimits: observeGroqLimitsForKey(apiKey),
         });
-        if (signal.aborted) return { success: false, error: 'Session closed' };
+        if (signal.aborted || sessionId !== currentSessionId) return cancelledCompletionResult(signal, primaryModel);
         const answer = display.finish(result.text);
         if (!answer) throw new Error(`Groq returned no visible answer (${result.model})`);
-        const displayedAnswer = result.truncated ? `${answer}\n\n[Answer reached the 512-token limit. Ask a narrower question to continue.]` : answer;
-        if (result.truncated) sendToRenderer('update-response', displayedAnswer);
+        const displayedAnswer = result.truncated ? `${answer}\n\n[Answer reached the ${completionTokens}-token limit. Ask a narrower question to continue.]` : answer;
+        if (result.truncated) display.update(displayedAnswer);
 
         groqTextModelOverride = result.model === config.groqModel?.trim() ? null : result.model;
         groqConversationHistory.push({ role: 'user', content: input.slice(0, 1800) }, { role: 'assistant', content: answer.slice(0, 1800) });
@@ -429,35 +537,51 @@ async function sendToGroq(transcription) {
         saveConversationTurn(input, displayedAnswer);
         logTransportEvent('groq.text.completed', { model: result.model, response: answer });
         const warning = result.truncated
-            ? 'Groq answer reached the 512-token limit'
+            ? `Groq answer reached the ${completionTokens}-token limit`
             : result.model !== config.groqModel?.trim()
               ? `Using Groq text fallback: ${result.model}`
               : '';
         sendToRenderer('update-status', warning || 'Listening...');
         return { success: true, text: displayedAnswer, model: result.model, warning, truncated: result.truncated === true };
     } catch (error) {
-        if (signal.aborted) return { success: false, error: 'Session closed' };
+        if (signal.aborted || sessionId !== currentSessionId) return cancelledCompletionResult(signal, primaryModel);
         console.error('Error calling Groq API:', error);
         logTransportEvent('groq.text.error', { error: error.message });
         sendToRenderer('update-status', `Groq error: ${error.message}`);
         return { success: false, error: error.message, status: error.status, retryAfterMs: error.retryAfterMs };
+    } finally {
+        request.finish();
     }
 }
 
-async function sendImageToGroq(base64Data, prompt) {
+function sendImageToGroq(base64Data, prompt) {
+    return enqueueGroqCompletion(() => sendImageToGroqNow(base64Data, prompt));
+}
+
+async function sendImageToGroqNow(base64Data, prompt) {
     const apiKey = getGroqApiKey()?.trim();
     const model = getConfig().groqImageModel?.trim();
     if (!apiKey) return { success: false, error: 'Groq API key is required for screenshots' };
     if (!model) return { success: false, error: 'Choose a Groq screenshot model in settings' };
-    const signal = groqRequestController.signal;
+    const request = startCompletionRequest();
+    const signal = request.signal;
+    const sessionId = currentSessionId;
     const input = String(prompt || '').slice(0, 1200);
     const display = displayGroqProgress(signal);
+    const { profile, context, language, style } = screenshotPromptSettings();
+    const priorAnswers = recentAnswerContext(900);
+    const currentRequest = priorAnswers ? `${priorAnswers}\n\nCurrent screenshot request: ${input}` : input;
+    const basePrompt = getScreenshotSystemPrompt(profile, '', language, style);
+    // Match groqClient's 6500-token budget, 3072-token image reserve, 1024-token output reserve, and two message frames.
+    // Leave 192 bytes for the context heading/truncation notice and token-estimation rounding.
+    const availableContextBytes = (6500 - 3072 - 1024 - 24) * 3 - 192 - Buffer.byteLength(basePrompt, 'utf8') - Buffer.byteLength(currentRequest, 'utf8');
+    const maxContextBytes = Math.max(0, Math.min(3000, availableContextBytes));
     const messages = [
-        { role: 'system', content: groqSystemPrompt() },
+        { role: 'system', content: getScreenshotSystemPrompt(profile, context, language, style, maxContextBytes) },
         {
             role: 'user',
             content: [
-                { type: 'text', text: input },
+                { type: 'text', text: currentRequest },
                 { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Data}` } },
             ],
         },
@@ -475,23 +599,25 @@ async function sendImageToGroq(base64Data, prompt) {
             onProgress: text => display.update(text),
             onRateLimits: observeGroqLimitsForKey(apiKey),
         });
-        if (signal.aborted) return { success: false, error: 'Session closed' };
+        if (signal.aborted || sessionId !== currentSessionId) return cancelledCompletionResult(signal, model);
         const answer = display.finish(result.text);
         if (!answer) throw new Error(`Groq returned no visible screenshot answer (${result.model})`);
         const displayedAnswer = result.truncated
             ? `${answer}\n\n[Answer reached the 1024-token limit. Ask about a smaller part of the screenshot to continue.]`
             : answer;
-        if (result.truncated) sendToRenderer('update-response', displayedAnswer);
-        incrementCharUsage('groq', result.model, messages[0].content.length + input.length + answer.length);
+        if (result.truncated) display.update(displayedAnswer);
+        incrementCharUsage('groq', result.model, messages[0].content.length + currentRequest.length + answer.length);
         saveScreenAnalysis(input, displayedAnswer, result.model);
         logTransportEvent('groq.image.completed', { model: result.model, response: answer });
         return { success: true, text: displayedAnswer, model: result.model, truncated: result.truncated === true };
     } catch (error) {
-        if (signal.aborted) return { success: false, error: 'Session closed' };
+        if (signal.aborted || sessionId !== currentSessionId) return cancelledCompletionResult(signal, model);
         console.error('Error calling Groq image API:', error);
         logTransportEvent('groq.image.error', { error: error.message });
         sendToRenderer('update-status', `Groq screenshot error: ${error.message}`);
         return { success: false, error: error.message };
+    } finally {
+        request.finish();
     }
 }
 
@@ -538,7 +664,7 @@ async function sendToGemma(transcription) {
         });
 
         let fullText = '';
-        let isFirst = true;
+        const responseStream = createResponseStream(sendToRenderer);
         let usageMetadata = null;
 
         for await (const chunk of response) {
@@ -546,8 +672,7 @@ async function sendToGemma(transcription) {
             const chunkText = chunk.text;
             if (chunkText) {
                 fullText += chunkText;
-                sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
-                isFirst = false;
+                responseStream.update(fullText);
             }
         }
         if (usageMetadata) observeUsage(usageMetadata);
@@ -602,6 +727,8 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
     let startupFailure = null;
     let connectedSession = null;
     let closeTransport = () => {};
+    let liveResponseStream = null;
+    let ambiguousLiveTranscription = false;
     try {
         // Open the transport log before setup so failures before connect are recorded too.
         if (!isReconnect) initializeNewSession(profile, customPrompt);
@@ -617,11 +744,15 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         const enabledTools = await getEnabledTools();
         const googleSearchEnabled = enabledTools.some(tool => tool.googleSearch);
 
-        const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled, language);
+        const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled, language, currentResponseStyle);
         currentSystemPrompt = systemPrompt; // Store for Groq
         currentResponseLanguage = language;
 
-        const liveModel = getConfig().geminiLiveModel;
+        const config = getConfig();
+        const liveModel = config.geminiLiveModel;
+        if (!isReconnect) currentGeminiResponseProvider = config.responseProvider === 'groq' ? 'groq' : 'gemini';
+        const useGroqResponses = currentGeminiResponseProvider === 'groq';
+        if (useGroqResponses && !hasGroqKey()) throw new Error('Groq API key is required for the selected answer provider');
         const observeUsage = observeGeminiUsageForKey(apiKey, 'live', liveModel, currentSessionId);
         const session = await connectWithSetupGuard(
             guard =>
@@ -634,50 +765,107 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                         },
                         onmessage: function (message) {
                             if (guard.isAbandoned()) return;
+                            if (
+                                connectedSession &&
+                                (closedGeminiSessions.has(connectedSession) ||
+                                    (global.geminiSessionRef?.current && global.geminiSessionRef.current !== connectedSession))
+                            ) {
+                                return;
+                            }
                             console.log('----------------', message);
                             logTransportEvent('gemini.live.message', message);
                             if (message.usageMetadata) observeUsage(message.usageMetadata);
 
                             // Handle input transcription (what was spoken)
-                            if (message.serverContent?.inputTranscription?.results) {
-                                currentTranscription += formatSpeakerResults(message.serverContent.inputTranscription.results);
-                            } else if (message.serverContent?.inputTranscription?.text) {
-                                const text = message.serverContent.inputTranscription.text;
-                                if (text.trim() !== '') {
-                                    currentTranscription += text;
+                            const spokenText = message.serverContent?.inputTranscription?.results
+                                ? formatSpeakerResults(message.serverContent.inputTranscription.results)
+                                : message.serverContent?.inputTranscription?.text || '';
+                            if (spokenText.trim()) {
+                                // A recognized speech turn can cancel a separate HTTP answer
+                                // when interruption is enabled. Report it once per turn.
+                                if (currentInterruptOnNewRequest && (!liveSpeechRequestNotified || (liveResponseStream && !ambiguousLiveTranscription))) {
+                                    interruptActiveCompletionRequests();
                                 }
+                                liveSpeechRequestNotified = true;
+                                // Live transcription chunks have no reliable turn IDs. If more
+                                // speech arrives during output, avoid persisting a mixed A+B turn.
+                                if (liveResponseStream) ambiguousLiveTranscription = true;
+                                currentTranscription += spokenText;
                             }
 
-                            if (message.serverContent?.inputTranscription && geminiTranscriptionFlushTimer) scheduleFinalTranscriptionToGroq();
+                            if (useGroqResponses && message.serverContent?.inputTranscription && geminiTranscriptionFlushTimer) {
+                                scheduleFinalTranscriptionToGroq();
+                            }
 
-                            if (!hasGroqKey() && message.serverContent?.outputTranscription?.text) {
-                                const isFirstChunk = messageBuffer === '';
+                            if (!useGroqResponses && message.serverContent?.outputTranscription?.text) {
+                                liveReplyActive = true;
+                                liveResponseStream ||= createResponseStream(sendToRenderer);
                                 messageBuffer += message.serverContent.outputTranscription.text;
-                                sendToRenderer(isFirstChunk ? 'new-response' : 'update-response', messageBuffer);
+                                liveResponseStream.update(messageBuffer);
+                            }
+
+                            if (message.serverContent?.interrupted) {
+                                if (liveResponseStream && messageBuffer.trim()) liveResponseStream.update(`${messageBuffer}\n\n[Interrupted]`);
+                                messageBuffer = '';
+                                liveResponseStream = null;
                             }
 
                             if (message.serverContent?.generationComplete) {
-                                if (currentTranscription.trim() !== '') {
-                                    if (!hasGroqKey() && messageBuffer.trim() !== '') {
-                                        saveConversationTurn(currentTranscription, messageBuffer);
+                                const completedQuestion = currentLiveTypedQuestion || currentTranscription;
+                                if (completedQuestion.trim() !== '') {
+                                    if (
+                                        !useGroqResponses &&
+                                        !ambiguousLiveTranscription &&
+                                        !(currentLiveTypedQuestion && currentTranscription.trim()) &&
+                                        messageBuffer.trim() !== ''
+                                    ) {
+                                        saveConversationTurn(completedQuestion, messageBuffer);
                                     }
-                                    if (hasGroqKey()) scheduleFinalTranscriptionToGroq();
+                                    if (useGroqResponses) scheduleFinalTranscriptionToGroq();
                                     else currentTranscription = '';
                                 }
+                                currentLiveTypedQuestion = '';
                                 messageBuffer = '';
+                                liveResponseStream = null;
+                                ambiguousLiveTranscription = false;
                             }
 
                             if (message.serverContent?.turnComplete) {
-                                if (hasGroqKey()) scheduleFinalTranscriptionToGroq();
+                                if (useGroqResponses) scheduleFinalTranscriptionToGroq();
                                 else currentTranscription = '';
+                                currentLiveTypedQuestion = '';
                                 messageBuffer = '';
+                                liveResponseStream = null;
+                                ambiguousLiveTranscription = false;
+                                if (!useGroqResponses) liveSpeechRequestNotified = false;
                                 sendToRenderer('update-status', 'Listening...');
+                                liveReplyActive = false;
+                                const nextText = pendingLiveTexts.shift();
+                                if (nextText && connectedSession === global.geminiSessionRef?.current) {
+                                    liveReplyActive = true;
+                                    try {
+                                        currentLiveTypedQuestion = nextText;
+                                        connectedSession.sendRealtimeInput({ text: nextText });
+                                    } catch (error) {
+                                        liveReplyActive = false;
+                                        currentLiveTypedQuestion = '';
+                                        sendToRenderer('update-status', `Could not send queued text: ${error.message}`);
+                                    }
+                                }
+                                void flushLiveScreenMemory();
                             }
                         },
                         onerror: function (e) {
                             const reason = safeGeminiErrorText(e, apiKey);
                             console.log('Session error:', reason);
                             if (guard.isAbandoned()) return;
+                            if (
+                                connectedSession &&
+                                (closedGeminiSessions.has(connectedSession) ||
+                                    (global.geminiSessionRef?.current && global.geminiSessionRef.current !== connectedSession))
+                            ) {
+                                return;
+                            }
                             const setupError = new Error(reason);
                             setupError.code = e?.code;
                             if (!startupComplete) startupFailure ||= setupError;
@@ -701,6 +889,9 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                             ) {
                                 return;
                             }
+                            liveReplyActive = false;
+                            currentLiveTypedQuestion = '';
+                            liveSpeechRequestNotified = false;
                             const setupError = new Error(closeReason);
                             setupError.code = e?.code;
                             if (!startupComplete) startupFailure ||= setupError;
@@ -730,6 +921,7 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                             if (isNonRetryableGeminiError(e) || geminiReconnectBlockedReason) {
                                 const reason = geminiReconnectBlockedReason || closeReason;
                                 sessionParams = null;
+                                pendingLiveTexts = [];
                                 closeTransportLog();
                                 sendToRenderer('update-status', `Gemini Live stopped: ${reason}`);
                                 return;
@@ -749,6 +941,11 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                         outputAudioTranscription: {},
                         tools: enabledTools,
                         inputAudioTranscription: {},
+                        realtimeInputConfig: {
+                            activityHandling: currentInterruptOnNewRequest
+                                ? ActivityHandling.START_OF_ACTIVITY_INTERRUPTS
+                                : ActivityHandling.NO_INTERRUPTION,
+                        },
                         contextWindowCompression: { slidingWindow: {} },
                         systemInstruction: {
                             parts: [{ text: systemPrompt }],
@@ -825,17 +1022,39 @@ async function attemptReconnect() {
         if (session && !closedGeminiSessions.has(session) && global.geminiSessionRef) {
             global.geminiSessionRef.current = session;
 
-            // Restore context from conversation history via text message
+            // Add bounded context without asking the model to produce a reply.
             const contextMessage = buildContextMessage();
             if (contextMessage) {
                 try {
                     console.log('Restoring conversation context...');
-                    await session.sendRealtimeInput({ text: contextMessage });
+                    await session.sendClientContent({
+                        turns: [{ role: 'user', parts: [{ text: contextMessage }] }],
+                        turnComplete: false,
+                    });
                 } catch (contextError) {
                     console.error('Failed to restore context:', contextError);
                     // Continue without context - better than failing
                 }
             }
+            // Reconnection restores the bounded screenshot context as part of
+            // the session history, so it need not be sent a second time.
+            pendingLiveScreenMemory = [];
+
+            // A typed request accepted while the old socket was answering must
+            // not remain stranded if that socket closed before turnComplete.
+            const queuedText = pendingLiveTexts.shift();
+            if (queuedText) {
+                try {
+                    currentLiveTypedQuestion = queuedText;
+                    await session.sendRealtimeInput({ text: queuedText });
+                    liveReplyActive = true;
+                } catch (sendError) {
+                    liveReplyActive = false;
+                    currentLiveTypedQuestion = '';
+                    sendToRenderer('update-status', `Could not send queued text after reconnect: ${sendError.message}`);
+                }
+            }
+            void flushLiveScreenMemory();
 
             // Don't reset reconnectAttempts here - let it reset on next fresh session
             sendToRenderer('update-status', 'Reconnected! Listening...');
@@ -1031,10 +1250,15 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
 
     if (!currentSessionId) initializeNewSession();
     const observeUsage = observeGeminiUsageForKey(apiKey, 'image', model, currentSessionId);
+    const request = startCompletionRequest();
+    const signal = request.signal;
+    const sessionId = currentSessionId;
     try {
         const ai = new GoogleGenAI({ apiKey: apiKey });
 
-        const language = getPreferences().selectedLanguage || 'en-US';
+        const { profile, context, language, style } = screenshotPromptSettings();
+        const systemPrompt = getScreenshotSystemPrompt(profile, context, language, style);
+        const priorAnswers = recentAnswerContext(1500);
         const contents = [
             {
                 inlineData: {
@@ -1042,29 +1266,30 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
                     data: base64Data,
                 },
             },
-            { text: `${prompt}\nAnswer in ${language}.` },
+            { text: `${priorAnswers ? `${priorAnswers}\n\n` : ''}Current screenshot request: ${prompt}\nAnswer in ${language}.` },
         ];
 
         console.log(`Sending image to ${model} (streaming)...`);
         const response = await ai.models.generateContentStream({
             model: model,
             contents: contents,
+            config: { systemInstruction: systemPrompt, abortSignal: signal },
         });
 
         // Stream the response
         let fullText = '';
-        let isFirst = true;
+        const responseStream = createResponseStream(sendToRenderer);
         let usageMetadata = null;
         for await (const chunk of response) {
+            if (signal.aborted || sessionId !== currentSessionId) return cancelledCompletionResult(signal, model);
             if (chunk.usageMetadata) usageMetadata = chunk.usageMetadata;
             const chunkText = chunk.text;
             if (chunkText) {
                 fullText += chunkText;
-                // Send to renderer - new response for first chunk, update for subsequent
-                sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
-                isFirst = false;
+                responseStream.update(fullText);
             }
         }
+        if (signal.aborted || sessionId !== currentSessionId) return cancelledCompletionResult(signal, model);
         if (usageMetadata) observeUsage(usageMetadata);
 
         console.log(`Image response completed from ${model}`);
@@ -1074,8 +1299,11 @@ async function sendImageToGeminiHttp(base64Data, prompt) {
 
         return { success: true, text: fullText, model: model };
     } catch (error) {
+        if (signal.aborted || sessionId !== currentSessionId) return cancelledCompletionResult(signal, model);
         console.error('Error sending image to Gemini HTTP:', error);
         return { success: false, error: error.message };
+    } finally {
+        request.finish();
     }
 }
 
@@ -1087,8 +1315,9 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         try {
             currentProviderMode = 'cloud';
             initializeNewSession(profile);
+            const sessionId = currentSessionId;
             setOnTurnComplete((transcription, response) => {
-                saveConversationTurn(transcription, response);
+                if (sessionId === currentSessionId) saveConversationTurn(transcription, response);
             });
             sendToRenderer('session-initializing', true);
             await connectCloud(token, profile, userContext);
@@ -1316,13 +1545,27 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         try {
             console.log('Sending text message:', text);
 
-            if (hasGroqKey()) {
-                return await sendToGroq(text.trim());
-            }
+            if (currentGeminiResponseProvider === 'groq') return await sendToGroq(text.trim());
 
-            await geminiSessionRef.current.sendRealtimeInput({ text: text.trim() });
+            if (currentInterruptOnNewRequest) {
+                interruptActiveCompletionRequests();
+                currentTranscription = '';
+                currentLiveTypedQuestion = text.trim();
+                await geminiSessionRef.current.sendClientContent({
+                    turns: [{ role: 'user', parts: [{ text: text.trim() }] }],
+                    turnComplete: true,
+                });
+            } else {
+                if (liveReplyActive) pendingLiveTexts.push(text.trim());
+                else {
+                    liveReplyActive = true;
+                    currentLiveTypedQuestion = text.trim();
+                    await geminiSessionRef.current.sendRealtimeInput({ text: text.trim() });
+                }
+            }
             return { success: true };
         } catch (error) {
+            currentLiveTypedQuestion = '';
             console.error('Error sending text:', error);
             return { success: false, error: error.message };
         }
@@ -1359,6 +1602,15 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         try {
             stopMacOSAudioCapture();
             cancelGroqRequests();
+            currentSessionId = null;
+            conversationHistory = [];
+            screenAnalysisHistory = [];
+            groqConversationHistory = [];
+            pendingLiveTexts = [];
+            currentLiveTypedQuestion = '';
+            liveSpeechRequestNotified = false;
+            pendingLiveScreenMemory = [];
+            liveReplyActive = false;
             geminiReconnectBlockedReason = null;
 
             if (groqTranscriptionSession) {

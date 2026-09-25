@@ -215,6 +215,39 @@ test('sends reasoning fields only for known compatible models', async () => {
     assert.equal('include_reasoning' in bodies[2], false);
 });
 
+test('optional detailed text cap is sent to Groq and reserved in the rolling token budget', async () => {
+    const client = createGroqClient(fakeClock());
+    let body;
+    const fetchImpl = async (_url, options) => {
+        body = JSON.parse(options.body);
+        return sseResponse();
+    };
+    await client.requestGroqCompletion({ apiKey: 'key', model: 'text-model', messages, maxCompletionTokens: 1_024, fetchImpl });
+    assert.equal(body.max_completion_tokens, 1_024);
+    await client.requestGroqCompletion({ apiKey: 'key', model: 'text-model', messages, maxCompletionTokens: 2_048, fetchImpl });
+    assert.equal(body.max_completion_tokens, 2_048);
+
+    const nearBudgetMessages = [{ role: 'user', content: 'a'.repeat(17_500) }];
+    await assert.rejects(
+        createGroqClient(fakeClock()).requestGroqCompletion({
+            apiKey: 'key',
+            model: 'text-model',
+            messages: nearBudgetMessages,
+            maxCompletionTokens: 1_024,
+            fetchImpl,
+        }),
+        /above the 6500-token per-minute budget/
+    );
+    await createGroqClient(fakeClock()).requestGroqCompletion({
+        apiKey: 'key',
+        model: 'text-model',
+        messages: nearBudgetMessages,
+        maxCompletionTokens: 512,
+        fetchImpl,
+    });
+    assert.equal(body.max_completion_tokens, 512);
+});
+
 test('reserves a larger image completion allowance in the request and token budget', async () => {
     const client = createGroqClient(fakeClock());
     let body;

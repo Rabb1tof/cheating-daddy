@@ -1,112 +1,197 @@
 name: Build installers
 
 on:
-  push:
-    branches:
-      - release/**
-  workflow_dispatch:
+    push:
+        branches:
+            - release/**
+    workflow_dispatch:
 
 permissions:
-  contents: read
+    contents: read
 
 jobs:
-  windows:
-    runs-on: windows-2022
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '20'
-          cache: npm
-      - run: npm ci
-      - run: npm test
-      - run: npm run make -- --platform=win32 --arch=x64
-      - name: Verify installer and write checksum
-        shell: pwsh
-        run: |
-          $installer = Get-ChildItem -LiteralPath 'out/make/squirrel.windows/x64' -Filter '*Setup.exe' -File | Select-Object -First 1
-          if (-not $installer -or $installer.Length -le 0) { throw 'Windows installer was not created' }
-          $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $($installer.Name)" | Set-Content -LiteralPath 'out/make/squirrel.windows/x64/SHA256SUMS.txt' -Encoding ascii
-      - uses: actions/upload-artifact@v7
-        with:
-          name: cheating-daddy-windows-x64-0.8.4
-          path: out/make/squirrel.windows/x64/
-          if-no-files-found: error
+    windows:
+        runs-on: windows-2022
+        steps:
+            - uses: actions/checkout@v7
+            - uses: actions/setup-node@v7
+              with:
+                  node-version: '20'
+                  cache: npm
+            - run: npm ci
+            - run: npm test
+            - run: npm run make -- --platform=win32 --arch=x64
+            - name: Verify installer and write checksum
+              shell: pwsh
+              run: |
+                  $installer = Get-ChildItem -LiteralPath 'out/make/squirrel.windows/x64' -Filter '*Setup.exe' -File | Select-Object -First 1
+                  if (-not $installer -or $installer.Length -le 0) { throw 'Windows installer was not created' }
+                  $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                  "$hash  $($installer.Name)" | Set-Content -LiteralPath 'out/make/squirrel.windows/x64/SHA256SUMS.txt' -Encoding ascii
+            - uses: actions/upload-artifact@v7
+              with:
+                  name: cheating-daddy-windows-x64-0.8.4
+                  path: out/make/squirrel.windows/x64/
+                  if-no-files-found: error
 
-  macos:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '20'
-          cache: npm
-      - name: Build the macOS 15 arm64 audio helper
-        run: |
-          swift build --package-path macos/SystemAudioDump -c release
-          cp "$(swift build --package-path macos/SystemAudioDump -c release --show-bin-path)/SystemAudioDump" src/assets/SystemAudioDump
-          chmod +x src/assets/SystemAudioDump
-          test "$(lipo -archs src/assets/SystemAudioDump)" = arm64
-      - run: npm ci
-      - run: npm test
-      - run: npm run make -- --platform=darwin --arch=arm64
-      - name: Verify app permissions and DMG
-        run: |
-          app=$(find out -maxdepth 2 -type d -name '*.app' -print -quit)
-          test -n "$app"
-          plutil -extract NSMicrophoneUsageDescription raw -o - "$app/Contents/Info.plist"
-          plutil -extract NSAudioCaptureUsageDescription raw -o - "$app/Contents/Info.plist"
-          test -s "$app/Contents/Resources/LICENSE"
-          test "$(lipo -archs "$app/Contents/Resources/SystemAudioDump")" = arm64
-          codesign --verify --verbose=2 "$app/Contents/Resources/SystemAudioDump"
-          codesign --verify --deep --strict --verbose=2 "$app"
-          dmg=$(find out/make -maxdepth 1 -type f -name '*.dmg' -print -quit)
-          test -s "$dmg"
-          shasum -a 256 "$dmg" | sed "s#out/make/##" > out/make/SHA256SUMS-macos.txt
-      - uses: actions/upload-artifact@v7
-        with:
-          name: cheating-daddy-macos-arm64-0.8.4
-          path: |
-            out/make/*.dmg
-            out/make/SHA256SUMS-macos.txt
-          if-no-files-found: error
+    macos:
+        runs-on: macos-15
+        steps:
+            - uses: actions/checkout@v7
+            - uses: actions/setup-node@v7
+              with:
+                  node-version: '20'
+                  cache: npm
+            - name: Build the macOS 15 arm64 audio helper
+              run: |
+                  swift build --package-path macos/SystemAudioDump -c release
+                  cp "$(swift build --package-path macos/SystemAudioDump -c release --show-bin-path)/SystemAudioDump" src/assets/SystemAudioDump
+                  chmod +x src/assets/SystemAudioDump
+                  test "$(lipo -archs src/assets/SystemAudioDump)" = arm64
+            - run: npm ci
+            - run: npm test
+            - run: npm run make -- --platform=darwin --arch=arm64
+            - name: Verify delivered macOS app and launch
+              shell: bash
+              run: |
+                  dmg=$(find out/make -maxdepth 1 -type f -name '*.dmg' -print -quit)
+                  test -s "$dmg"
+                  smoke_dir=$(mktemp -d "$RUNNER_TEMP/cheating-daddy-smoke.XXXXXX")
+                  mount_point="$smoke_dir/mount"
+                  launch_log="$smoke_dir/launch.log"
+                  app_pid=''
+                  mounted=0
 
-  release:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'
-    needs: [windows, macos]
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
-        with:
-          name: cheating-daddy-windows-x64-0.8.4
-          path: artifacts/windows
-      - uses: actions/download-artifact@v7
-        with:
-          name: cheating-daddy-macos-arm64-0.8.4
-          path: artifacts/macos
-      - name: Verify artifacts and prepare release files
-        run: |
-          (cd artifacts/windows && sed 's/\r$//' SHA256SUMS.txt | sha256sum --check)
-          (cd artifacts/macos && sha256sum --check SHA256SUMS-macos.txt)
-          installer=$(find artifacts/windows -maxdepth 1 -type f -name '*Setup.exe' -print -quit)
-          dmg=$(find artifacts/macos -maxdepth 1 -type f -name '*.dmg' -print -quit)
-          test -s "$installer"
-          test -s "$dmg"
-          mkdir -p release
-          cp "$installer" release/Cheating-Daddy-0.8.4-Setup-x64.exe
-          cp "$dmg" release/Cheating-Daddy-0.8.4-arm64.dmg
-          (cd release && sha256sum *.exe *.dmg > SHA256SUMS.txt)
-      - name: Publish installers
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          gh release create v0.8.4 release/*.exe release/*.dmg release/SHA256SUMS.txt \
-            --target "$GITHUB_SHA" \
-            --title 'Cheating Daddy 0.8.4' \
-            --notes-file docs/releases/v0.8.4.md
+                  cleanup() {
+                    status=$?
+                    trap - EXIT
+                    if [[ -n "$app_pid" ]]; then
+                      if kill -0 "$app_pid" 2>/dev/null; then
+                        kill "$app_pid" 2>/dev/null || true
+                        for attempt in {1..5}; do
+                          if ! kill -0 "$app_pid" 2>/dev/null; then break; fi
+                          sleep 1
+                        done
+                        if kill -0 "$app_pid" 2>/dev/null; then
+                          kill -KILL "$app_pid" 2>/dev/null || true
+                        fi
+                      fi
+                      wait "$app_pid" 2>/dev/null || true
+                    fi
+                    if [[ "$mounted" = 1 ]]; then
+                      if ! hdiutil detach "$mount_point"; then status=1; fi
+                    fi
+                    if [[ -f "$launch_log" ]]; then
+                      echo 'Packaged macOS app launch output:'
+                      cat "$launch_log"
+                    fi
+                    exit "$status"
+                  }
+                  trap cleanup EXIT
+                  trap 'exit 130' INT
+                  trap 'exit 143' TERM
+
+                  mkdir "$mount_point" "$smoke_dir/installed"
+                  hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$mount_point" "$dmg"
+                  mounted=1
+                  delivered_app=$(find "$mount_point" -maxdepth 1 -type d -name '*.app' -print -quit)
+                  test -n "$delivered_app"
+                  app="$smoke_dir/installed/$(basename "$delivered_app")"
+                  ditto "$delivered_app" "$app"
+                  hdiutil detach "$mount_point"
+                  mounted=0
+
+                  plutil -extract NSMicrophoneUsageDescription raw -o - "$app/Contents/Info.plist"
+                  plutil -extract NSAudioCaptureUsageDescription raw -o - "$app/Contents/Info.plist"
+                  test -s "$app/Contents/Resources/LICENSE"
+                  test "$(lipo -archs "$app/Contents/Resources/SystemAudioDump")" = arm64
+                  codesign --verify --verbose=2 "$app/Contents/Resources/SystemAudioDump"
+                  codesign --verify --deep --strict --verbose=2 "$app"
+
+                  verify_ad_hoc_signature() {
+                    signature=$(codesign --display --verbose=4 "$1" 2>&1)
+                    printf '%s\n' "$signature"
+                    printf '%s\n' "$signature" | grep -q '^Signature=adhoc$'
+                    flags=$(printf '%s\n' "$signature" | sed -nE 's/^CodeDirectory .* flags=(0x[[:xdigit:]]+).*/\1/p')
+                    test -n "$flags"
+                    # Reject CS_RUNTIME (0x10000) and CS_REQUIRE_LV (0x2000) for this ad hoc release.
+                    if (( (flags & 0x12000) != 0 )); then
+                      echo "::error::Ad hoc signed code enables hardened runtime or library validation: $1"
+                      return 1
+                    fi
+                  }
+
+                  executable=$(plutil -extract CFBundleExecutable raw -o - "$app/Contents/Info.plist")
+                  main_executable="$app/Contents/MacOS/$executable"
+                  test -x "$main_executable"
+                  test "$(lipo -archs "$main_executable")" = arm64
+                  verify_ad_hoc_signature "$app"
+                  verify_ad_hoc_signature "$main_executable"
+                  verify_ad_hoc_signature "$app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
+                  verify_ad_hoc_signature "$app/Contents/Resources/SystemAudioDump"
+                  helper_count=0
+                  while IFS= read -r -d '' helper_app; do
+                    verify_ad_hoc_signature "$helper_app"
+                    ((helper_count += 1))
+                  done < <(find "$app/Contents/Frameworks" -type d -name '*.app' -print0)
+                  test "$helper_count" -gt 0
+
+                  "$main_executable" --user-data-dir="$smoke_dir/user-data" > "$launch_log" 2>&1 &
+                  app_pid=$!
+                  for attempt in {1..10}; do
+                    sleep 1
+                    if ! kill -0 "$app_pid" 2>/dev/null; then
+                      if wait "$app_pid"; then exit_code=0; else exit_code=$?; fi
+                      app_pid=''
+                      echo "::error::Packaged macOS app exited during startup (exit $exit_code)"
+                      exit 1
+                    fi
+                  done
+                  echo 'Packaged macOS app remained running for 10 seconds.'
+                  shasum -a 256 "$dmg" | sed "s#out/make/##" > out/make/SHA256SUMS-macos.txt
+            - uses: actions/upload-artifact@v7
+              with:
+                  name: cheating-daddy-macos-arm64-0.8.4
+                  path: |
+                      out/make/*.dmg
+                      out/make/SHA256SUMS-macos.txt
+                  if-no-files-found: error
+
+    release:
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'
+        needs: [windows, macos]
+        runs-on: ubuntu-latest
+        permissions:
+            actions: read
+            contents: write
+        steps:
+            - uses: actions/checkout@v7
+            - uses: actions/download-artifact@v7
+              with:
+                  name: cheating-daddy-windows-x64-0.8.4
+                  path: artifacts/windows
+            - uses: actions/download-artifact@v7
+              with:
+                  name: cheating-daddy-macos-arm64-0.8.4
+                  path: artifacts/macos
+            - name: Verify artifacts and prepare release files
+              run: |
+                  (cd artifacts/windows && sed 's/\r$//' SHA256SUMS.txt | sha256sum --check)
+                  (cd artifacts/macos && sha256sum --check SHA256SUMS-macos.txt)
+                  installer=$(find artifacts/windows -maxdepth 1 -type f -name '*Setup.exe' -print -quit)
+                  dmg=$(find artifacts/macos -maxdepth 1 -type f -name '*.dmg' -print -quit)
+                  test -s "$installer"
+                  test -s "$dmg"
+                  mkdir -p release
+                  cp "$installer" release/Cheating-Daddy-0.8.4-Setup-x64.exe
+                  cp "$dmg" release/Cheating-Daddy-0.8.4-arm64.dmg
+                  (cd release && sha256sum *.exe *.dmg > SHA256SUMS.txt)
+            - name: Publish installers
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  GH_REPO: ${{ github.repository }}
+              run: |
+                  gh release create v0.8.4 release/*.exe release/*.dmg release/SHA256SUMS.txt \
+                    --target "$GITHUB_SHA" \
+                    --title 'Cheating Daddy 0.8.4' \
+                    --notes-file docs/releases/v0.8.4.md

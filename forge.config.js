@@ -11,7 +11,8 @@ module.exports = {
             identity: '-',
             identityValidation: false,
             continueOnError: false,
-            optionsForFile: () => ({ timestamp: 'none' }),
+            // Ad hoc signatures have no Team ID for hardened runtime's library validation.
+            optionsForFile: () => ({ hardenedRuntime: false, timestamp: 'none' }),
         },
         extendInfo: {
             NSMicrophoneUsageDescription: 'Cheating Daddy captures microphone audio only while an assistant session is active.',
